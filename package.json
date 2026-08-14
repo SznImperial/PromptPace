@@ -1,7 +1,9 @@
 {
-  "name": "prompt-pace-app",
-  "version": "0.1.0",
-  "private": true,
+  "name": "promptpace",
+  "version": "1.0.0",
+  "bin": {
+    "promptpace": "./bin/promptpace.js"
+  },
   "scripts": {
     "dev": "next dev",
     "build": "next build",

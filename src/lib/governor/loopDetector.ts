@@ -3,66 +3,118 @@ export interface LoopAnalysisResult {
   isLoopDetected: boolean;
   reason?: string;
   duplicateCount: number;
+  maxSimilarity: number;
 }
 
 export class LoopDetector {
-  private recentSignatures: Array<{
-    hash: string;
+  private recentHistory: Array<{
+    rawHash: string;
+    normalizedHash: string;
+    normalizedText: string;
     timestamp: number;
-    promptSnippet: string;
   }> = [];
 
-  private maxHistory = 15;
+  private maxWindow = 8;
+
+  /**
+   * Sanitizes prompt and error content by stripping volatile elements:
+   * - ANSI color codes
+   * - ISO timestamps, Unix epoch timestamps, relative time strings
+   * - Volatile file paths (e.g., /tmp/..., C:\Users\..., .next/...)
+   * - Random UUIDs, hashes, port numbers, line/column numbers
+   */
+  public normalizeContent(content: string): string {
+    if (!content) return '';
+
+    return content
+      // Strip ANSI escape codes
+      .replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '')
+      // Strip ISO timestamps (e.g., 2026-08-14T22:44:11.123Z)
+      .replace(/\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?/gi, '')
+      // Strip Unix epoch timestamps (10-13 digits)
+      .replace(/\b1[6-9]\d{8,11}\b/g, '')
+      // Strip UUIDs (e.g. 123e4567-e89b-12d3-a456-426614174000)
+      .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, '')
+      // Strip file paths with line/col numbers (e.g., src/auth.ts:42:15 or C:\project\index.js:10)
+      .replace(/(?:[a-zA-Z]:\\|\/)?(?:[\w.-]+[/\\])+[\w.-]+(?::\d+(?::\d+)?)?/g, '[PATH]')
+      // Strip memory addresses (0x7ffe...)
+      .replace(/0x[0-9a-fA-F]+/g, '[HEX]')
+      // Normalize variable whitespace
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+  }
 
   public analyzeRequest(promptSnippet: string): LoopAnalysisResult {
     const now = Date.now();
-    const cleanSnippet = promptSnippet.trim().toLowerCase().slice(0, 300);
-    const hash = this.simpleHash(cleanSnippet);
+    const rawHash = this.simpleHash(promptSnippet.trim());
+    const normalizedText = this.normalizeContent(promptSnippet);
+    const normalizedHash = this.simpleHash(normalizedText);
 
-    // Prune entries older than 3 minutes
-    this.recentSignatures = this.recentSignatures.filter(
-      (entry) => now - entry.timestamp < 180000
+    // Prune entries older than 4 minutes
+    this.recentHistory = this.recentHistory.filter(
+      (entry) => now - entry.timestamp < 240000
     );
 
-    // Check for exact / near duplicate hash in recent history
-    let duplicateCount = 0;
-    for (const entry of this.recentSignatures) {
-      if (entry.hash === hash || this.similarity(entry.promptSnippet, cleanSnippet) > 0.85) {
-        duplicateCount++;
+    let exactNormalizedMatches = 0;
+    let maxSimilarity = 0.0;
+    let nearDuplicateCount = 0;
+
+    for (const prev of this.recentHistory) {
+      if (prev.normalizedHash === normalizedHash) {
+        exactNormalizedMatches++;
+        maxSimilarity = 1.0;
+      } else {
+        const sim = this.calculateSimilarity(prev.normalizedText, normalizedText);
+        if (sim > maxSimilarity) {
+          maxSimilarity = sim;
+        }
+        if (sim >= 0.88) {
+          nearDuplicateCount++;
+        }
       }
     }
 
     // Check burst rate: how many requests in the last 10 seconds?
-    const burstCount = this.recentSignatures.filter(
+    const burstCount = this.recentHistory.filter(
       (entry) => now - entry.timestamp < 10000
     ).length;
 
-    // Push current entry
-    this.recentSignatures.push({
-      hash,
+    // Push current entry into rolling window
+    this.recentHistory.push({
+      rawHash,
+      normalizedHash,
+      normalizedText,
       timestamp: now,
-      promptSnippet: cleanSnippet,
     });
 
-    if (this.recentSignatures.length > this.maxHistory) {
-      this.recentSignatures.shift();
+    if (this.recentHistory.length > this.maxWindow) {
+      this.recentHistory.shift();
     }
 
-    // Heuristics calculation
+    // Heuristics Score Calculation
     let riskScore = 0;
     let reason = '';
 
-    if (duplicateCount >= 3) {
-      riskScore = 90;
-      reason = `Repetitive retry pattern detected (${duplicateCount} identical iterations in 3m)`;
-    } else if (duplicateCount === 2) {
-      riskScore = 65;
-      reason = 'Potential retry loop emerging (2 near-identical prompts)';
+    if (exactNormalizedMatches >= 2) {
+      riskScore = 95;
+      reason = `Identical normalized loop detected (${exactNormalizedMatches + 1} identical iterations in rolling window)`;
+    } else if (exactNormalizedMatches === 1) {
+      riskScore = 70;
+      reason = 'Duplicate normalized prompt detected in recent window';
+    } else if (nearDuplicateCount >= 2 || maxSimilarity >= 0.90) {
+      riskScore = 85;
+      reason = `Fuzzy retry death-loop detected (${(maxSimilarity * 100).toFixed(0)}% prompt overlap)`;
+    } else if (nearDuplicateCount === 1 || maxSimilarity >= 0.82) {
+      riskScore = 55;
+      reason = `High prompt similarity detected (${(maxSimilarity * 100).toFixed(0)}% match)`;
     }
 
     if (burstCount >= 5) {
-      riskScore = Math.max(riskScore, 85);
-      reason = reason ? `${reason} + High burst rate (${burstCount} reqs / 10s)` : `Rapid request burst detected (${burstCount} reqs / 10s)`;
+      riskScore = Math.max(riskScore, 90);
+      reason = reason
+        ? `${reason} + High burst rate (${burstCount} reqs / 10s)`
+        : `Rapid request burst detected (${burstCount} reqs / 10s)`;
     }
 
     const isLoopDetected = riskScore >= 75;
@@ -71,12 +123,13 @@ export class LoopDetector {
       riskScore,
       isLoopDetected,
       reason: reason || undefined,
-      duplicateCount,
+      duplicateCount: exactNormalizedMatches + nearDuplicateCount,
+      maxSimilarity: Number(maxSimilarity.toFixed(2)),
     };
   }
 
   public reset(): void {
-    this.recentSignatures = [];
+    this.recentHistory = [];
   }
 
   private simpleHash(str: string): string {
@@ -84,26 +137,42 @@ export class LoopDetector {
     for (let i = 0; i < str.length; i++) {
       const char = str.charCodeAt(i);
       hash = (hash << 5) - hash + char;
-      hash |= 0; // Convert to 32bit integer
+      hash |= 0;
     }
     return hash.toString(16);
   }
 
-  private similarity(s1: string, s2: string): number {
+  /**
+   * Fast hybrid similarity combining 3-gram Jaccard overlap and word token overlap
+   */
+  private calculateSimilarity(s1: string, s2: string): number {
     if (!s1 || !s2) return 0;
     if (s1 === s2) return 1.0;
+
+    // Word token overlap
+    const words1 = new Set(s1.split(/\s+/).filter(w => w.length > 2));
+    const words2 = new Set(s2.split(/\s+/).filter(w => w.length > 2));
     
-    // Quick Jaccard similarity of 3-character shingles
-    const set1 = this.getShingles(s1);
-    const set2 = this.getShingles(s2);
-    
-    let intersection = 0;
-    for (const shingle of set1) {
-      if (set2.has(shingle)) intersection++;
+    let wordInter = 0;
+    for (const w of words1) {
+      if (words2.has(w)) wordInter++;
     }
-    
-    const union = set1.size + set2.size - intersection;
-    return union === 0 ? 0 : intersection / union;
+    const wordUnion = words1.size + words2.size - wordInter;
+    const wordSim = wordUnion === 0 ? 0 : wordInter / wordUnion;
+
+    // 3-gram character shingles overlap
+    const sh1 = this.getShingles(s1);
+    const sh2 = this.getShingles(s2);
+
+    let shInter = 0;
+    for (const s of sh1) {
+      if (sh2.has(s)) shInter++;
+    }
+    const shUnion = sh1.size + sh2.size - shInter;
+    const shSim = shUnion === 0 ? 0 : shInter / shUnion;
+
+    // Weighted combination
+    return 0.6 * wordSim + 0.4 * shSim;
   }
 
   private getShingles(str: string): Set<string> {

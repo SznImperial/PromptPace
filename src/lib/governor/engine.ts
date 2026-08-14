@@ -1,3 +1,5 @@
+import fs from 'fs';
+import path from 'path';
 import {
   PromptPaceSession,
   RequestLogEntry,
@@ -9,6 +11,8 @@ import { calculateCostUsd } from './pricing';
 import { LoopDetector } from './loopDetector';
 import { persistLogToSupabase, persistSessionToSupabase } from '../supabase/client';
 
+const CACHE_FILE_PATH = path.join(process.cwd(), '.promptpace-cache.json');
+
 class GovernorEngine {
   private session: PromptPaceSession;
   private logs: RequestLogEntry[] = [];
@@ -16,9 +20,10 @@ class GovernorEngine {
   private loopDetector = new LoopDetector();
   private listeners: Set<(payload: GovernorTelemetryPayload) => void> = new Set();
   private spendHistory: Array<{ timestamp: number; cost: number; tokens: number }> = [];
+  private activeStreamControllers: Map<string, AbortController> = new Map();
 
   constructor() {
-    this.session = {
+    this.session = this.loadPersistedState() || {
       id: 'session-live-default',
       name: 'Agent Speed Shield Session',
       targetAgent: 'Claude Code (Anthropic) / xAI Grok',
@@ -27,7 +32,8 @@ class GovernorEngine {
       warningThresholdPct: 80,
       burnRateLimitPerMin: 0.50,
       currentBurnRatePerMin: 0.00,
-      autoReloadThreshold: 10.00, // Provider auto-reloads at $10.00
+      autoReloadThreshold: 10.00, // Configured reload threshold line
+      providerMonthlyLimit: 100.00,
       status: 'active',
       pacingDelayMs: 0,
       totalRequests: 0,
@@ -36,6 +42,40 @@ class GovernorEngine {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
+  }
+
+  private loadPersistedState(): PromptPaceSession | null {
+    try {
+      if (fs.existsSync(CACHE_FILE_PATH)) {
+        const raw = fs.readFileSync(CACHE_FILE_PATH, 'utf-8');
+        const parsed = JSON.parse(raw);
+        if (parsed && parsed.session) {
+          return parsed.session;
+        }
+      }
+    } catch (e) {
+      console.warn('Could not read .promptpace-cache.json:', e);
+    }
+    return null;
+  }
+
+  private savePersistedState(): void {
+    try {
+      fs.writeFileSync(
+        CACHE_FILE_PATH,
+        JSON.stringify(
+          {
+            session: this.session,
+            updatedAt: new Date().toISOString(),
+          },
+          null,
+          2
+        ),
+        'utf-8'
+      );
+    } catch (e) {
+      // Non-critical file cache write
+    }
   }
 
   public getSession(): PromptPaceSession {
@@ -98,10 +138,11 @@ class GovernorEngine {
         tokensPerMin: tokensLastMin,
         zone,
       },
-      stripeShield: {
-        providerThreshold: this.session.autoReloadThreshold,
+      providerShield: {
+        autoReloadThreshold: this.session.autoReloadThreshold,
         spentThisSession: Number(this.session.spentAmount.toFixed(4)),
         bufferRemaining: Number(bufferRemaining.toFixed(4)),
+        monthlyLimit: this.session.providerMonthlyLimit,
         status: shieldStatus,
       },
     };
@@ -109,14 +150,13 @@ class GovernorEngine {
 
   public subscribe(listener: (payload: GovernorTelemetryPayload) => void): () => void {
     this.listeners.add(listener);
-    // Emit initial payload immediately
     listener(this.getTelemetryPayload());
     return () => {
       this.listeners.delete(listener);
     };
   }
 
-  private notifyListeners(): void {
+  public notifyListeners(): void {
     const payload = this.getTelemetryPayload();
     this.listeners.forEach((listener) => {
       try {
@@ -128,33 +168,28 @@ class GovernorEngine {
   }
 
   /**
-   * Evaluates before sending request to AI provider.
-   * If budget exceeded or loop detected, holds request in-flight.
+   * Pre-flight governor check before starting a request
    */
   public async preflightCheck(params: {
     model: string;
     promptSnippet: string;
     estimatedTokens?: number;
   }): Promise<{ action: 'proceed' | 'kill'; delayMs: number }> {
-    // 1. Check Loop Detection
     const loopAnalysis = this.loopDetector.analyzeRequest(params.promptSnippet);
     this.session.loopRiskScore = loopAnalysis.riskScore;
 
-    // 2. Check Throttle Pacing Delay
     const delayMs = this.session.pacingDelayMs;
 
-    // 3. Check Session Status
     if (this.session.status === 'killed') {
       return { action: 'kill', delayMs: 0 };
     }
 
     const estimatedCost = calculateCostUsd(
       params.model,
-      params.estimatedTokens || 1500,
-      500
+      params.estimatedTokens || 1200,
+      400
     );
 
-    // 4. Budget Breaker Check
     const willExceedBudget =
       this.session.spentAmount + estimatedCost >= this.session.tripBudget;
 
@@ -170,7 +205,7 @@ class GovernorEngine {
 
       if (loopAnalysis.isLoopDetected) {
         reason = 'death_loop_detected';
-        message = `Autonomous loop detected: ${loopAnalysis.reason || 'Rapid repetitive prompts'}`;
+        message = `Autonomous loop detected: ${loopAnalysis.reason || 'Repeating error patterns'}`;
       } else if (this.session.status === 'paused') {
         reason = 'manual_pause';
         message = 'Agent session manually paused by user.';
@@ -179,7 +214,6 @@ class GovernorEngine {
       this.session.status = 'held';
       this.notifyListeners();
 
-      // Return a Promise that holds execution in flight
       const holdResult = await this.createInFlightHold({
         reason,
         details: {
@@ -195,12 +229,65 @@ class GovernorEngine {
       return { action: holdResult, delayMs };
     }
 
-    // Apply pacing delay if configured
     if (delayMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
 
     return { action: 'proceed', delayMs };
+  }
+
+  /**
+   * Mid-stream chunk budget check.
+   * If a streaming call balloons past remaining trip budget, returns shouldAbort = true.
+   */
+  public checkStreamLimit(params: {
+    model: string;
+    promptTokens: number;
+    currentOutputTokens: number;
+  }): { shouldAbort: boolean; currentCost: number; reason?: string } {
+    const currentCost = calculateCostUsd(
+      params.model,
+      params.promptTokens,
+      params.currentOutputTokens
+    );
+
+    // If current spend + this call's cost exceeds trip budget, trigger mid-flight abort
+    if (this.session.spentAmount + currentCost >= this.session.tripBudget) {
+      return {
+        shouldAbort: true,
+        currentCost,
+        reason: `Streaming response breached trip budget ($${this.session.tripBudget.toFixed(2)}) mid-flight!`,
+      };
+    }
+
+    // Safety ceiling: If a SINGLE call consumes > 50% of the entire trip budget, flag runaway
+    const singleCallMax = this.session.tripBudget * 0.5;
+    if (currentCost > singleCallMax && singleCallMax > 0.5) {
+      return {
+        shouldAbort: true,
+        currentCost,
+        reason: `Single streaming response consumed >50% of trip budget ($${currentCost.toFixed(3)}). Aborted mid-flight.`,
+      };
+    }
+
+    return { shouldAbort: false, currentCost };
+  }
+
+  public registerStreamController(streamId: string, controller: AbortController): void {
+    this.activeStreamControllers.set(streamId, controller);
+  }
+
+  public unregisterStreamController(streamId: string): void {
+    this.activeStreamControllers.delete(streamId);
+  }
+
+  public abortAllActiveStreams(): void {
+    this.activeStreamControllers.forEach((controller) => {
+      try {
+        controller.abort();
+      } catch (e) {}
+    });
+    this.activeStreamControllers.clear();
   }
 
   private createInFlightHold(params: {
@@ -231,7 +318,7 @@ class GovernorEngine {
   }
 
   /**
-   * Records completed request metrics and updates odometer and burn rate
+   * Records completed request metrics and persists state to disk + Supabase
    */
   public recordCompletedRequest(params: {
     provider: RequestLogEntry['provider'];
@@ -240,6 +327,8 @@ class GovernorEngine {
     promptTokens: number;
     completionTokens: number;
     durationMs: number;
+    isStreaming?: boolean;
+    status?: RequestLogEntry['status'];
     promptSnippet?: string;
   }): RequestLogEntry {
     const cost = calculateCostUsd(
@@ -257,19 +346,16 @@ class GovernorEngine {
     this.session.lastRequestTime = now;
     this.session.updatedAt = new Date().toISOString();
 
-    // Check if auto-reload threshold reached
     if (this.session.spentAmount >= this.session.tripBudget) {
       this.session.status = 'exhausted';
     }
 
-    // Add to rolling history for burn rate calculation
     this.spendHistory.push({
       timestamp: now,
       cost,
       tokens: totalTokens,
     });
 
-    // Prune spend history older than 5 minutes
     this.spendHistory = this.spendHistory.filter((h) => now - h.timestamp < 300000);
 
     const logEntry: RequestLogEntry = {
@@ -284,7 +370,8 @@ class GovernorEngine {
       totalTokens,
       costUsd: cost,
       durationMs: params.durationMs,
-      status: 'completed',
+      status: params.status || 'completed',
+      isStreaming: params.isStreaming || false,
       loopRiskScore: this.session.loopRiskScore,
       promptSnippet: params.promptSnippet,
     };
@@ -294,7 +381,7 @@ class GovernorEngine {
       this.logs.shift();
     }
 
-    // Persist asynchronously
+    this.savePersistedState();
     persistLogToSupabase(logEntry);
     persistSessionToSupabase(this.session);
 
@@ -302,9 +389,6 @@ class GovernorEngine {
     return logEntry;
   }
 
-  /**
-   * Handles user actions from UI or Webhook
-   */
   public handleAction(action: GovernorActionType, payload?: any): void {
     switch (action) {
       case 'refuel': {
@@ -314,10 +398,7 @@ class GovernorEngine {
         this.loopDetector.reset();
         this.session.loopRiskScore = 0;
 
-        // Release any held requests
-        this.activeHolds.forEach((hold) => {
-          hold.resolve('proceed');
-        });
+        this.activeHolds.forEach((hold) => hold.resolve('proceed'));
         this.activeHolds.clear();
         break;
       }
@@ -342,6 +423,7 @@ class GovernorEngine {
 
       case 'emergency_kill': {
         this.session.status = 'killed';
+        this.abortAllActiveStreams();
         this.activeHolds.forEach((hold) => hold.resolve('kill'));
         this.activeHolds.clear();
         break;
@@ -357,6 +439,9 @@ class GovernorEngine {
         if (payload?.autoReloadThreshold !== undefined) {
           this.session.autoReloadThreshold = Number(payload.autoReloadThreshold);
         }
+        if (payload?.providerMonthlyLimit !== undefined) {
+          this.session.providerMonthlyLimit = Number(payload.providerMonthlyLimit);
+        }
         if (payload?.pacingDelayMs !== undefined) {
           this.session.pacingDelayMs = Number(payload.pacingDelayMs);
         }
@@ -371,19 +456,20 @@ class GovernorEngine {
         this.session.loopRiskScore = 0;
         this.spendHistory = [];
         this.loopDetector.reset();
+        this.abortAllActiveStreams();
         this.activeHolds.forEach((hold) => hold.resolve('proceed'));
         this.activeHolds.clear();
         break;
       }
     }
 
+    this.savePersistedState();
     persistSessionToSupabase(this.session);
     this.notifyListeners();
   }
 
   private updateBurnRate(): void {
     const now = Date.now();
-    // Rolling 60-second window
     const recentSpends = this.spendHistory.filter(
       (entry) => now - entry.timestamp < 60000
     );
@@ -397,7 +483,6 @@ class GovernorEngine {
   }
 }
 
-// Global Singleton for in-memory state preservation in Next.js development and server runtime
 const globalForGovernor = global as unknown as { promptPaceGovernor: GovernorEngine };
 export const governorEngine = globalForGovernor.promptPaceGovernor || new GovernorEngine();
 if (process.env.NODE_ENV !== 'production') {

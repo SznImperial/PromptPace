@@ -3,13 +3,16 @@ import { governorEngine } from '@/lib/governor/engine';
 
 export async function POST(req: NextRequest) {
   const startTime = Date.now();
+  const streamId = `stream_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+  const abortController = new AbortController();
 
   try {
     const body = await req.json();
     const model = body.model || 'grok-2-1212';
     const messages = body.messages || [];
+    const isStream = Boolean(body.stream);
 
-    // Extract prompt snippet
+    // Extract prompt snippet for loop detection
     let promptSnippet = '';
     if (messages.length > 0) {
       const lastMsg = messages[messages.length - 1];
@@ -39,11 +42,17 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Check upstream authorization
     const authHeader = req.headers.get('authorization');
-    const apiKey = authHeader ? authHeader.replace('Bearer ', '') : (isXai ? process.env.XAI_API_KEY : process.env.OPENAI_API_KEY);
+    const apiKey = authHeader
+      ? authHeader.replace('Bearer ', '')
+      : isXai
+      ? process.env.XAI_API_KEY
+      : process.env.OPENAI_API_KEY;
 
+    // A. LIVE FORWARDING
     if (apiKey && !apiKey.startsWith('mock-')) {
+      governorEngine.registerStreamController(streamId, abortController);
+
       const upstreamUrl = isXai
         ? 'https://api.x.ai/v1/chat/completions'
         : 'https://api.openai.com/v1/chat/completions';
@@ -55,30 +64,131 @@ export async function POST(req: NextRequest) {
           'Authorization': `Bearer ${apiKey}`,
         },
         body: JSON.stringify(body),
+        signal: abortController.signal,
       });
 
-      const responseData = await upstreamRes.json();
-      const durationMs = Date.now() - startTime;
+      if (!isStream) {
+        governorEngine.unregisterStreamController(streamId);
+        const responseData = await upstreamRes.json();
+        const durationMs = Date.now() - startTime;
 
-      const promptTokens = responseData.usage?.prompt_tokens || 700;
-      const completionTokens = responseData.usage?.completion_tokens || 200;
+        const promptTokens = responseData.usage?.prompt_tokens || 700;
+        const completionTokens = responseData.usage?.completion_tokens || 200;
 
-      governorEngine.recordCompletedRequest({
-        provider,
-        model,
-        endpoint: '/v1/chat/completions',
-        promptTokens,
-        completionTokens,
-        durationMs,
-        promptSnippet: promptSnippet.slice(0, 120),
+        governorEngine.recordCompletedRequest({
+          provider,
+          model,
+          endpoint: '/v1/chat/completions',
+          promptTokens,
+          completionTokens,
+          durationMs,
+          promptSnippet: promptSnippet.slice(0, 120),
+        });
+
+        return NextResponse.json(responseData, { status: upstreamRes.status });
+      }
+
+      // STREAMING MODE
+      let accumulatedOutputTokens = 0;
+      let promptTokensEstimated = 750;
+      let hasAbortedMidFlight = false;
+
+      const upstreamBody = upstreamRes.body;
+      if (!upstreamBody) {
+        governorEngine.unregisterStreamController(streamId);
+        return new Response('No upstream stream body', { status: 502 });
+      }
+
+      const reader = upstreamBody.getReader();
+      const encoder = new TextEncoder();
+      const decoder = new TextDecoder();
+
+      const stream = new ReadableStream({
+        async pull(controller) {
+          try {
+            const { done, value } = await reader.read();
+
+            if (done || hasAbortedMidFlight) {
+              governorEngine.unregisterStreamController(streamId);
+              governorEngine.recordCompletedRequest({
+                provider,
+                model,
+                endpoint: '/v1/chat/completions',
+                promptTokens: promptTokensEstimated,
+                completionTokens: accumulatedOutputTokens,
+                durationMs: Date.now() - startTime,
+                isStreaming: true,
+                status: hasAbortedMidFlight ? 'aborted_mid_stream' : 'completed',
+                promptSnippet: promptSnippet.slice(0, 120),
+              });
+              controller.close();
+              return;
+            }
+
+            const chunkText = decoder.decode(value, { stream: true });
+            const lines = chunkText.split('\n');
+
+            for (const line of lines) {
+              if (line.startsWith('data: ')) {
+                const dataStr = line.slice(6).trim();
+                if (dataStr && dataStr !== '[DONE]') {
+                  try {
+                    const parsed = JSON.parse(dataStr);
+                    if (parsed.usage?.prompt_tokens) {
+                      promptTokensEstimated = parsed.usage.prompt_tokens;
+                    }
+                    if (parsed.usage?.completion_tokens) {
+                      accumulatedOutputTokens = parsed.usage.completion_tokens;
+                    } else if (parsed.choices?.[0]?.delta?.content) {
+                      accumulatedOutputTokens += Math.max(1, Math.ceil(parsed.choices[0].delta.content.length / 4));
+                    }
+                  } catch (e) {}
+                }
+              }
+            }
+
+            const limitCheck = governorEngine.checkStreamLimit({
+              model,
+              promptTokens: promptTokensEstimated,
+              currentOutputTokens: accumulatedOutputTokens,
+            });
+
+            if (limitCheck.shouldAbort && !hasAbortedMidFlight) {
+              hasAbortedMidFlight = true;
+              abortController.abort();
+
+              const warningChunk = `data: {"id":"chatcmpl-${Date.now()}","choices":[{"delta":{"content":"\\n\\n🛑 [PromptPace Governor]: Mid-stream abort triggered. ${limitCheck.reason}"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n`;
+              controller.enqueue(encoder.encode(warningChunk));
+              controller.close();
+              return;
+            }
+
+            controller.enqueue(value);
+          } catch (streamErr: any) {
+            governorEngine.unregisterStreamController(streamId);
+            if (!hasAbortedMidFlight) {
+              controller.error(streamErr);
+            } else {
+              controller.close();
+            }
+          }
+        },
+        cancel() {
+          abortController.abort();
+          governorEngine.unregisterStreamController(streamId);
+        },
       });
 
-      return NextResponse.json(responseData, {
-        status: upstreamRes.status,
+      return new Response(stream, {
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+        },
       });
     }
 
-    // Simulated response for immediate zero-config testing
+    // B. SIMULATED RESPONSE
     const simulatedPromptTokens = Math.floor(Math.random() * 300) + 500;
     const simulatedCompletionTokens = Math.floor(Math.random() * 200) + 120;
     const durationMs = Date.now() - startTime + 280;

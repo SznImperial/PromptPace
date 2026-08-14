@@ -11,7 +11,8 @@ export interface PromptPaceSession {
   warningThresholdPct: number; // e.g. 80% ($1.60)
   burnRateLimitPerMin: number; // e.g. $0.50/min
   currentBurnRatePerMin: number; // live calculated $/min
-  autoReloadThreshold: number; // e.g. $10.00 (provider auto-reload line)
+  autoReloadThreshold: number; // e.g. $10.00 (configured reload trigger)
+  providerMonthlyLimit?: number; // e.g. $100.00 (hard monthly limit)
   status: SessionStatus;
   pacingDelayMs: number; // injected delay for throttle mode (e.g. 2500ms)
   totalRequests: number;
@@ -34,7 +35,8 @@ export interface RequestLogEntry {
   totalTokens: number;
   costUsd: number;
   durationMs: number;
-  status: 'completed' | 'held' | 'throttled' | 'rejected' | 'failed';
+  status: 'completed' | 'held' | 'throttled' | 'aborted_mid_stream' | 'rejected' | 'failed';
+  isStreaming?: boolean;
   loopRiskScore: number;
   promptSnippet?: string;
   errorSignature?: string;
@@ -44,7 +46,7 @@ export interface InFlightHold {
   holdId: string;
   sessionId: string;
   requestedAt: number;
-  reason: 'trip_budget_exceeded' | 'warning_threshold_reached' | 'burn_rate_spike' | 'death_loop_detected' | 'manual_pause';
+  reason: 'trip_budget_exceeded' | 'warning_threshold_reached' | 'burn_rate_spike' | 'death_loop_detected' | 'manual_pause' | 'mid_stream_budget_breach';
   details: {
     spentAmount: number;
     tripBudget: number;
@@ -68,19 +70,20 @@ export interface GovernorTelemetryPayload {
     tokensPerMin: number;
     zone: 'safe' | 'caution' | 'danger';
   };
-  stripeShield: {
-    providerThreshold: number;
+  providerShield: {
+    autoReloadThreshold: number;
     spentThisSession: number;
     bufferRemaining: number;
+    monthlyLimit?: number;
     status: 'shield_active' | 'shield_engaged' | 'danger';
   };
 }
 
 export type GovernorActionType = 
-  | 'refuel' // Add additional $X to budget & resume held request
-  | 'pause'  // Manually hold next incoming requests
-  | 'resume' // Resume active session
-  | 'throttle' // Toggle / set pacing delay (e.g. 3000ms delay per call)
-  | 'emergency_kill' // Drop held request and kill session
-  | 'update_config' // Modify trip budget, burn rate limit, etc.
-  | 'reset_trip'; // Reset odometer to $0.00
+  | 'refuel'
+  | 'pause'
+  | 'resume'
+  | 'throttle'
+  | 'emergency_kill'
+  | 'update_config'
+  | 'reset_trip';

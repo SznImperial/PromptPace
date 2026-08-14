@@ -136,7 +136,7 @@ export default function PromptPaceMissionControl() {
     );
   }
 
-  const { session, speedometer, stripeShield, recentLogs, activeHold } = telemetry;
+  const { session, speedometer, providerShield, recentLogs, activeHold } = telemetry;
 
   return (
     <div className="min-h-screen bg-neutral-950 text-neutral-100 flex flex-col font-sans selection:bg-emerald-500/30 selection:text-emerald-300">
@@ -162,7 +162,7 @@ export default function PromptPaceMissionControl() {
       {/* Main Mission Control Cockpit */}
       <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 lg:p-8 flex flex-col gap-6">
         
-        {/* Row 1: Core Telemetry Gauges (Speedometer, Trip Odometer, Stripe Shield) */}
+        {/* Row 1: Core Telemetry Gauges (Speedometer, Trip Odometer, Provider Shield) */}
         <section className="grid grid-cols-1 md:grid-cols-3 gap-6">
           <Speedometer
             currentBurnRate={speedometer.currentBurnRate}
@@ -178,10 +178,11 @@ export default function PromptPaceMissionControl() {
           />
 
           <StripeShieldCard
-            providerThreshold={stripeShield.providerThreshold}
-            spentThisSession={stripeShield.spentThisSession}
-            bufferRemaining={stripeShield.bufferRemaining}
-            status={stripeShield.status}
+            providerThreshold={providerShield.autoReloadThreshold}
+            spentThisSession={providerShield.spentThisSession}
+            bufferRemaining={providerShield.bufferRemaining}
+            monthlyLimit={providerShield.monthlyLimit}
+            status={providerShield.status}
             onUpdateProviderThreshold={(autoReloadThreshold) =>
               handleUpdateConfig({ autoReloadThreshold })
             }
