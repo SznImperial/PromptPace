@@ -88,10 +88,11 @@ export async function POST(req: NextRequest) {
         return NextResponse.json(responseData, { status: upstreamRes.status });
       }
 
-      // STREAMING MODE
+      // STREAMING MODE: Chunk-by-chunk token interception & strict OpenAI SDK protocol compliance
       let accumulatedOutputTokens = 0;
       let promptTokensEstimated = 750;
       let hasAbortedMidFlight = false;
+      const completionId = `chatcmpl-${Date.now()}`;
 
       const upstreamBody = upstreamRes.body;
       if (!upstreamBody) {
@@ -155,10 +156,52 @@ export async function POST(req: NextRequest) {
 
             if (limitCheck.shouldAbort && !hasAbortedMidFlight) {
               hasAbortedMidFlight = true;
-              abortController.abort();
 
-              const warningChunk = `data: {"id":"chatcmpl-${Date.now()}","choices":[{"delta":{"content":"\\n\\n🛑 [PromptPace Governor]: Mid-stream abort triggered. ${limitCheck.reason}"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n`;
-              controller.enqueue(encoder.encode(warningChunk));
+              // 💥 Step 1: Explicitly cancel stream reader & abort upstream TCP socket immediately
+              try {
+                await reader.cancel('promptpace_budget_limit_severed');
+              } catch (e) {}
+              abortController.abort();
+              governorEngine.unregisterStreamController(streamId);
+
+              // 🛡️ Step 2: Inject strict 3-chunk OpenAI SDK protocol sequence
+              const warningMsg = `\n\n🛑 [PromptPace Governor]: Mid-stream abort triggered. ${limitCheck.reason}`;
+              
+              // 1. Text delta chunk
+              const deltaChunk = `data: ${JSON.stringify({
+                id: completionId,
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                model,
+                choices: [
+                  {
+                    index: 0,
+                    delta: { content: warningMsg },
+                    finish_reason: null,
+                  },
+                ],
+              })}\n\n`;
+
+              // 2. Finish reason: "length" chunk
+              const stopChunk = `data: ${JSON.stringify({
+                id: completionId,
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                model,
+                choices: [
+                  {
+                    index: 0,
+                    delta: {},
+                    finish_reason: 'length',
+                  },
+                ],
+              })}\n\n`;
+
+              // 3. Terminal [DONE] chunk
+              const doneChunk = `data: [DONE]\n\n`;
+
+              const fullAbortPayload = deltaChunk + stopChunk + doneChunk;
+              controller.enqueue(encoder.encode(fullAbortPayload));
               controller.close();
               return;
             }
@@ -173,7 +216,10 @@ export async function POST(req: NextRequest) {
             }
           }
         },
-        cancel() {
+        async cancel() {
+          try {
+            await reader.cancel('client_disconnected');
+          } catch (e) {}
           abortController.abort();
           governorEngine.unregisterStreamController(streamId);
         },
@@ -182,7 +228,7 @@ export async function POST(req: NextRequest) {
       return new Response(stream, {
         headers: {
           'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
+          'Cache-Control': 'no-cache, no-transform',
           'Connection': 'keep-alive',
         },
       });

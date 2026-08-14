@@ -8,10 +8,21 @@ import {
   GovernorActionType,
 } from './types';
 import { calculateCostUsd } from './pricing';
-import { LoopDetector } from './loopDetector';
-import { persistLogToSupabase, persistSessionToSupabase } from '../supabase/client';
+import { LoopDetector, LoopAnalysisResult } from './loopDetector';
+import { supabase, persistLogToSupabase, persistSessionToSupabase } from '../supabase/client';
 
 const CACHE_FILE_PATH = path.join(process.cwd(), '.promptpace-cache.json');
+
+export interface LoopDiagnosticEntry {
+  timestamp: string;
+  rawSnippet: string;
+  normalizedSnippet: string;
+  duplicateCount: number;
+  maxSimilarity: number;
+  riskScore: number;
+  isLoopDetected: boolean;
+  reason?: string;
+}
 
 class GovernorEngine {
   private session: PromptPaceSession;
@@ -21,6 +32,7 @@ class GovernorEngine {
   private listeners: Set<(payload: GovernorTelemetryPayload) => void> = new Set();
   private spendHistory: Array<{ timestamp: number; cost: number; tokens: number }> = [];
   private activeStreamControllers: Map<string, AbortController> = new Map();
+  private loopDiagnostics: LoopDiagnosticEntry[] = [];
 
   constructor() {
     this.session = this.loadPersistedState() || {
@@ -32,7 +44,7 @@ class GovernorEngine {
       warningThresholdPct: 80,
       burnRateLimitPerMin: 0.50,
       currentBurnRatePerMin: 0.00,
-      autoReloadThreshold: 10.00, // Configured reload threshold line
+      autoReloadThreshold: 10.00, // Configured reload floor line
       providerMonthlyLimit: 100.00,
       status: 'active',
       pacingDelayMs: 0,
@@ -42,6 +54,9 @@ class GovernorEngine {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
+
+    // Reconcile disk state with Supabase conservatively
+    this.reconcileWithSupabase();
   }
 
   private loadPersistedState(): PromptPaceSession | null {
@@ -78,6 +93,46 @@ class GovernorEngine {
     }
   }
 
+  /**
+   * Conservative Reconciliation:
+   * Compares local disk cache with Supabase and selects the highest spentAmount
+   * and lowest trip budget to eliminate false sense of security after crashes.
+   */
+  private async reconcileWithSupabase(): Promise<void> {
+    if (!supabase) return;
+
+    try {
+      const { data, error } = await supabase
+        .from('promptpace_sessions')
+        .select('*')
+        .eq('id', this.session.id)
+        .single();
+
+      if (data && !error) {
+        const dbSpent = Number(data.spent_amount) || 0;
+        const localSpent = this.session.spentAmount;
+
+        // Take the more conservative (higher spent amount)
+        if (dbSpent > localSpent) {
+          console.log(`[PromptPace Reconciliation]: Supabase spent ($${dbSpent.toFixed(4)}) is higher than local disk ($${localSpent.toFixed(4)}). Adopting conservative higher value.`);
+          this.session.spentAmount = dbSpent;
+        } else if (localSpent > dbSpent) {
+          console.log(`[PromptPace Reconciliation]: Local disk spent ($${localSpent.toFixed(4)}) is higher than Supabase ($${dbSpent.toFixed(4)}). Updating Supabase to higher value.`);
+          persistSessionToSupabase(this.session);
+        }
+
+        if (data.trip_budget) {
+          this.session.tripBudget = Math.min(this.session.tripBudget, Number(data.trip_budget));
+        }
+
+        this.savePersistedState();
+        this.notifyListeners();
+      }
+    } catch (e) {
+      console.warn('Supabase reconciliation skipped:', e);
+    }
+  }
+
   public getSession(): PromptPaceSession {
     this.updateBurnRate();
     return { ...this.session };
@@ -85,6 +140,10 @@ class GovernorEngine {
 
   public getLogs(limit = 50): RequestLogEntry[] {
     return this.logs.slice(-limit).reverse();
+  }
+
+  public getLoopDiagnostics(limit = 20): LoopDiagnosticEntry[] {
+    return this.loopDiagnostics.slice(-limit).reverse();
   }
 
   public getActiveHold(): InFlightHold | null {
@@ -178,6 +237,9 @@ class GovernorEngine {
     const loopAnalysis = this.loopDetector.analyzeRequest(params.promptSnippet);
     this.session.loopRiskScore = loopAnalysis.riskScore;
 
+    // Record loop diagnostic telemetry for false-positive auditing
+    this.recordLoopDiagnostic(params.promptSnippet, loopAnalysis);
+
     const delayMs = this.session.pacingDelayMs;
 
     if (this.session.status === 'killed') {
@@ -236,9 +298,26 @@ class GovernorEngine {
     return { action: 'proceed', delayMs };
   }
 
+  private recordLoopDiagnostic(promptSnippet: string, result: LoopAnalysisResult): void {
+    const entry: LoopDiagnosticEntry = {
+      timestamp: new Date().toISOString(),
+      rawSnippet: promptSnippet.slice(0, 150),
+      normalizedSnippet: this.loopDetector.normalizeContent(promptSnippet).slice(0, 150),
+      duplicateCount: result.duplicateCount,
+      maxSimilarity: result.maxSimilarity,
+      riskScore: result.riskScore,
+      isLoopDetected: result.isLoopDetected,
+      reason: result.reason,
+    };
+
+    this.loopDiagnostics.push(entry);
+    if (this.loopDiagnostics.length > 50) {
+      this.loopDiagnostics.shift();
+    }
+  }
+
   /**
-   * Mid-stream chunk budget check.
-   * If a streaming call balloons past remaining trip budget, returns shouldAbort = true.
+   * Mid-stream chunk budget check
    */
   public checkStreamLimit(params: {
     model: string;
@@ -251,16 +330,14 @@ class GovernorEngine {
       params.currentOutputTokens
     );
 
-    // If current spend + this call's cost exceeds trip budget, trigger mid-flight abort
     if (this.session.spentAmount + currentCost >= this.session.tripBudget) {
       return {
         shouldAbort: true,
         currentCost,
-        reason: `Streaming response breached trip budget ($${this.session.tripBudget.toFixed(2)}) mid-flight!`,
+        reason: `Streaming response reached trip budget ($${this.session.tripBudget.toFixed(2)}) mid-flight!`,
       };
     }
 
-    // Safety ceiling: If a SINGLE call consumes > 50% of the entire trip budget, flag runaway
     const singleCallMax = this.session.tripBudget * 0.5;
     if (currentCost > singleCallMax && singleCallMax > 0.5) {
       return {
@@ -455,6 +532,7 @@ class GovernorEngine {
         this.session.status = 'active';
         this.session.loopRiskScore = 0;
         this.spendHistory = [];
+        this.loopDiagnostics = [];
         this.loopDetector.reset();
         this.abortAllActiveStreams();
         this.activeHolds.forEach((hold) => hold.resolve('proceed'));

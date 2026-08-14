@@ -29,13 +29,13 @@ export function StripeShieldCard({
             <CreditCard className="w-4 h-4" />
           </div>
           <div>
-            <h3 className="text-sm font-semibold text-neutral-100">Provider Limit & Reload Buffer</h3>
-            <p className="text-[11px] text-neutral-400 font-mono">Auto-Debit Prevention Barrier</p>
+            <h3 className="text-sm font-semibold text-neutral-100">Auto-Reload Floor Buffer</h3>
+            <p className="text-[11px] text-neutral-400 font-mono">Self-Reported Safety Boundary</p>
           </div>
         </div>
 
         <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-mono font-medium bg-purple-500/10 text-purple-300 border border-purple-500/30">
-          <ShieldCheck className="w-3.5 h-3.5" /> BUFFER ACTIVE
+          <ShieldCheck className="w-3.5 h-3.5" /> SHIELD CONFIGURED
         </span>
       </div>
 
@@ -43,14 +43,14 @@ export function StripeShieldCard({
       <div className="my-5 p-4 rounded-xl bg-neutral-950/80 border border-neutral-800 flex flex-col gap-3">
         <div className="flex justify-between items-start">
           <div>
-            <span className="text-xs text-neutral-400 font-medium">Safe Margin to Auto-Reload Line</span>
+            <span className="text-xs text-neutral-400 font-medium">Safe Margin to Reload Floor</span>
             <div className="text-2xl font-bold font-mono text-emerald-400 mt-0.5">
               ${bufferRemaining.toFixed(2)}
             </div>
           </div>
 
           <div className="text-right">
-            <span className="text-xs text-neutral-400 font-medium">Auto-Reload Floor</span>
+            <span className="text-xs text-neutral-400 font-medium">Reload Trigger Floor</span>
             <div className="text-sm font-mono text-neutral-300 mt-1">
               ${providerThreshold.toFixed(2)}
             </div>
@@ -63,13 +63,13 @@ export function StripeShieldCard({
         </div>
 
         <p className="text-[11px] text-neutral-400 leading-relaxed">
-          PromptPace enforces limits locally so your Anthropic/xAI balance never dips below your provider auto-reload line, preventing unexpected card token debits.
+          Matches your self-reported Anthropic / xAI auto-reload floor. PromptPace holds agent runs locally so your balance never crosses this line, avoiding silent card debits.
         </p>
       </div>
 
       {/* Adjust Provider Trigger */}
       <div className="flex items-center justify-between pt-3 border-t border-neutral-800/80 text-xs font-mono">
-        <span className="text-neutral-400">Auto-Reload Floor:</span>
+        <span className="text-neutral-400">Set Auto-Reload Floor:</span>
         <div className="flex gap-1.5">
           {[5, 10, 20, 50].map((val) => (
             <button

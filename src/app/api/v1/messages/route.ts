@@ -83,10 +83,11 @@ export async function POST(req: NextRequest) {
         return NextResponse.json(responseData, { status: upstreamRes.status });
       }
 
-      // STREAMING MODE: Chunk-by-chunk token interception & mid-flight abort
+      // STREAMING MODE: Chunk-by-chunk token interception & strict SDK state machine compliance
       let accumulatedOutputTokens = 0;
       let promptTokensEstimated = 900;
       let hasAbortedMidFlight = false;
+      let contentBlockIndex = 0;
 
       const upstreamBody = upstreamRes.body;
       if (!upstreamBody) {
@@ -122,7 +123,7 @@ export async function POST(req: NextRequest) {
 
             const chunkText = decoder.decode(value, { stream: true });
 
-            // Estimate tokens from chunk deltas
+            // Parse Anthropic SSE chunks
             const lines = chunkText.split('\n');
             for (const line of lines) {
               if (line.startsWith('data: ')) {
@@ -133,8 +134,11 @@ export async function POST(req: NextRequest) {
                     if (parsed.type === 'message_start' && parsed.message?.usage?.input_tokens) {
                       promptTokensEstimated = parsed.message.usage.input_tokens;
                     }
+                    if (parsed.type === 'content_block_start' && parsed.index !== undefined) {
+                      contentBlockIndex = parsed.index;
+                    }
                     if (parsed.type === 'content_block_delta' && parsed.delta?.text) {
-                      // ~4 characters per token estimate
+                      // Estimate token count (~4 characters/token)
                       accumulatedOutputTokens += Math.max(1, Math.ceil(parsed.delta.text.length / 4));
                     }
                     if (parsed.type === 'message_delta' && parsed.usage?.output_tokens) {
@@ -154,12 +158,44 @@ export async function POST(req: NextRequest) {
 
             if (limitCheck.shouldAbort && !hasAbortedMidFlight) {
               hasAbortedMidFlight = true;
-              // 💥 Abort upstream HTTP socket immediately to cut off provider billing
-              abortController.abort();
 
-              // Inject graceful client termination chunk so agent CLI doesn't throw socket error
-              const warningChunk = `event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\\n\\n🛑 [PromptPace Governor]: Mid-stream abort triggered. ${limitCheck.reason}"}}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"max_tokens"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n`;
-              controller.enqueue(encoder.encode(warningChunk));
+              // 💥 Step 1: Explicitly cancel stream reader & abort upstream TCP socket immediately
+              try {
+                await reader.cancel('promptpace_budget_limit_severed');
+              } catch (e) {}
+              abortController.abort();
+              governorEngine.unregisterStreamController(streamId);
+
+              // 🛡️ Step 2: Inject EXACT 4-Event Anthropic SDK State Machine Sequence to prevent client crash
+              const warningMsg = `\n\n🛑 [PromptPace Governor]: Mid-stream abort triggered. ${limitCheck.reason}`;
+              
+              // 1. Text delta with governor explanation
+              const deltaEvent = `event: content_block_delta\ndata: ${JSON.stringify({
+                type: 'content_block_delta',
+                index: contentBlockIndex,
+                delta: { type: 'text_delta', text: warningMsg },
+              })}\n\n`;
+
+              // 2. Content block stop (MANDATORY for Anthropic SDK state machine)
+              const blockStopEvent = `event: content_block_stop\ndata: ${JSON.stringify({
+                type: 'content_block_stop',
+                index: contentBlockIndex,
+              })}\n\n`;
+
+              // 3. Message delta with stop_reason: 'max_tokens'
+              const messageDeltaEvent = `event: message_delta\ndata: ${JSON.stringify({
+                type: 'message_delta',
+                delta: { stop_reason: 'max_tokens', stop_sequence: null },
+                usage: { output_tokens: accumulatedOutputTokens },
+              })}\n\n`;
+
+              // 4. Message stop
+              const messageStopEvent = `event: message_stop\ndata: ${JSON.stringify({
+                type: 'message_stop',
+              })}\n\n`;
+
+              const fullAbortPayload = deltaEvent + blockStopEvent + messageDeltaEvent + messageStopEvent;
+              controller.enqueue(encoder.encode(fullAbortPayload));
               controller.close();
               return;
             }
@@ -174,7 +210,10 @@ export async function POST(req: NextRequest) {
             }
           }
         },
-        cancel() {
+        async cancel() {
+          try {
+            await reader.cancel('client_disconnected');
+          } catch (e) {}
           abortController.abort();
           governorEngine.unregisterStreamController(streamId);
         },
@@ -183,7 +222,7 @@ export async function POST(req: NextRequest) {
       return new Response(stream, {
         headers: {
           'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
+          'Cache-Control': 'no-cache, no-transform',
           'Connection': 'keep-alive',
         },
       });
@@ -225,7 +264,7 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // Simulated SSE Stream
+    // Simulated compliant SSE stream
     const encoder = new TextEncoder();
     const simulatedChunks = [
       `event: message_start\ndata: {"type":"message_start","message":{"id":"msg_${Date.now()}","type":"message","role":"assistant","model":"${model}","usage":{"input_tokens":${simulatedPromptTokens},"output_tokens":1}}}\n\n`,
