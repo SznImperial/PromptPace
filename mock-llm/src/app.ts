@@ -113,6 +113,8 @@ export function createMockApp(overrides: Partial<MockConfig> = {}): Hono {
     );
     // Failure simulation: the upstream dies after N SSE events.
     const dropAfter = headerInt(c.req.header("x-mock-drop-after"), 0);
+    // Failure simulation: the upstream closes cleanly after N SSE events, without message_stop.
+    const stopAfter = headerInt(c.req.header("x-mock-stop-after"), 0);
 
     const model = request.model ?? config.model;
     const id = `msg_mock_${randomUUID()}`;
@@ -213,6 +215,11 @@ export function createMockApp(overrides: Partial<MockConfig> = {}): Hono {
             } else {
               stream.abort();
             }
+            return;
+          }
+
+          if (stopAfter > 0 && written >= stopAfter) {
+            // Close the stream cleanly, but without the message_stop event.
             return;
           }
 

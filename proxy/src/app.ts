@@ -1,11 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { Hono } from "hono";
 import type { Context } from "hono";
+import { createAdminApp, nodeRemoteAddress } from "./admin.js";
+import { checkSessionBudget, formatBudgetMessage } from "./budget.js";
 import type { Db } from "./db.js";
 import { recordRequest } from "./db.js";
 import { buildClientResponseHeaders, buildUpstreamHeaders } from "./headers.js";
 import type { PricingTable } from "./pricing.js";
 import { computeCost } from "./pricing.js";
+import { resolveSessionId } from "./session.js";
 import { forwardSseStream } from "./stream.js";
 import type { TokenUsage } from "./usage.js";
 import { ZERO_USAGE, mergeUsage, readUsageFields } from "./usage.js";
@@ -15,6 +18,10 @@ export interface ProxyConfig {
   db: Db;
   pricing: PricingTable;
   defaultSessionId: string;
+  /** Cap per session in USD from PROMPTPACE_BUDGET_USD. `null`/unset means no cap. */
+  budgetUsd?: number | null;
+  /** Resolves the caller's address. Only used by the admin API. */
+  remoteAddress?: (c: Context) => string | undefined;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -30,16 +37,26 @@ function parseJsonObject(raw: string): JsonObject | null {
   }
 }
 
-function errorResponse(c: Context, status: 400 | 501 | 502, type: string, message: string) {
+function errorResponse(c: Context, status: 400 | 402 | 500 | 502, type: string, message: string) {
   return c.json({ type: "error", error: { type, message } }, status);
 }
 
 export function createProxyApp(config: ProxyConfig): Hono {
   const app = new Hono();
   const upstreamUrl = new URL("/v1/messages", config.upstreamUrl).toString();
+  const defaultCapUsd = config.budgetUsd ?? null;
 
   app.get("/health", (c) =>
     c.json({ ok: true, service: "proxy", upstream: config.upstreamUrl }),
+  );
+
+  app.route(
+    "/admin",
+    createAdminApp({
+      db: config.db,
+      defaultCapUsd,
+      remoteAddress: config.remoteAddress ?? nodeRemoteAddress,
+    }),
   );
 
   app.post("/v1/messages", async (c) => {
@@ -49,7 +66,36 @@ export function createProxyApp(config: ProxyConfig): Hono {
 
     const model =
       (typeof requestJson?.model === "string" ? requestJson.model : undefined) ?? "unknown";
-    const sessionId = c.req.header("x-promptpace-session")?.trim() || config.defaultSessionId;
+    const sessionId = resolveSessionId(c.req.raw.headers, config.defaultSessionId);
+
+    const writeRow = (
+      usage: TokenUsage,
+      partial: boolean,
+      status: number,
+      blocked = false,
+    ): void => {
+      recordRequest(config.db, {
+        id: randomUUID(),
+        timestamp: new Date().toISOString(),
+        model,
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        cacheCreationTokens: usage.cacheCreationTokens,
+        cacheReadTokens: usage.cacheReadTokens,
+        cost: computeCost(config.pricing, model, usage),
+        status,
+        sessionId,
+        partial,
+        blocked,
+      });
+    };
+
+    // Budget gate: the upstream is never contacted when the session is over its cap.
+    const budget = checkSessionBudget(config.db, sessionId, defaultCapUsd);
+    if (budget.blocked) {
+      writeRow(ZERO_USAGE, false, 402, true);
+      return errorResponse(c, 402, "budget_exceeded", formatBudgetMessage(budget));
+    }
 
     const abortController = new AbortController();
     c.req.raw.signal.addEventListener("abort", () => abortController.abort(), { once: true });
@@ -66,22 +112,6 @@ export function createProxyApp(config: ProxyConfig): Hono {
       const message = error instanceof Error ? error.message : "Unknown upstream error";
       return errorResponse(c, 502, "upstream_error", message);
     }
-
-    const writeRow = (usage: TokenUsage, partial: boolean, status: number): void => {
-      recordRequest(config.db, {
-        id: randomUUID(),
-        timestamp: new Date().toISOString(),
-        model,
-        inputTokens: usage.inputTokens,
-        outputTokens: usage.outputTokens,
-        cacheCreationTokens: usage.cacheCreationTokens,
-        cacheReadTokens: usage.cacheReadTokens,
-        cost: computeCost(config.pricing, model, usage),
-        status,
-        sessionId,
-        partial,
-      });
-    };
 
     if (isStreaming) {
       // An error status arrives before any stream starts: pass it through untouched.

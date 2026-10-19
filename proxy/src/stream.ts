@@ -35,6 +35,7 @@ export class SseUsageParser {
     cacheCreationTokens: 0,
     cacheReadTokens: 0,
   };
+  private messageStopSeen = false;
 
   push(chunk: Uint8Array): void {
     this.buffer += this.decoder.decode(chunk, { stream: true });
@@ -48,6 +49,11 @@ export class SseUsageParser {
 
   getUsage(): TokenUsage {
     return { ...this.usage };
+  }
+
+  /** True once a `message_stop` event was seen. A stream without it is incomplete. */
+  sawMessageStop(): boolean {
+    return this.messageStopSeen;
   }
 
   private drain(): void {
@@ -78,7 +84,11 @@ export class SseUsageParser {
     }
 
     if (typeof parsed !== "object" || parsed === null) return;
-    this.usage = mergeUsage(this.usage, extractUsageFromSseEvent(parsed as Record<string, unknown>));
+    const event = parsed as Record<string, unknown>;
+    if (event.type === "message_stop") {
+      this.messageStopSeen = true;
+    }
+    this.usage = mergeUsage(this.usage, extractUsageFromSseEvent(event));
   }
 }
 
@@ -134,7 +144,8 @@ export function forwardSseStream(options: ForwardSseOptions): ReadableStream<Uin
         if (done) {
           parser.flush();
           controller.close();
-          settle(false);
+          // A stream that ended without `message_stop` did not finish cleanly.
+          settle(!parser.sawMessageStop());
           return;
         }
         if (value) {

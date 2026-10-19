@@ -270,4 +270,21 @@ describe("proxy streaming", () => {
     expect(row.input_tokens).toBe(1500);
     expect(row.output_tokens).toBe(0);
   });
+
+  it("logs a partial row when the stream closes cleanly without message_stop", async () => {
+    const res = await streamRequest(STREAM_BODY, {
+      "x-mock-stop-after": "4",
+      "x-mock-input-tokens": "1500",
+    });
+
+    const text = await res.text();
+    expect(text).toContain("message_start");
+    expect(text).not.toContain("message_stop");
+
+    const row = await waitForRow();
+    expect(row.partial).toBe(1);
+    expect(row.input_tokens).toBe(1500);
+    expect(row.output_tokens).toBe(0);
+    expect(row.status).toBe(200);
+  });
 });

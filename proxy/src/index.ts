@@ -14,21 +14,31 @@ function envInt(name: string, fallback: number): number {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function envUsd(name: string): number | null {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return null;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return null;
+  return parsed;
+}
+
 const port = envInt("PROXY_PORT", 8787);
 const upstreamUrl = process.env.UPSTREAM_URL ?? "http://127.0.0.1:8788";
 const dbPath = process.env.PROXY_DB_PATH ?? join(packageRoot, "data", "promptpace.db");
 const pricingPath = process.env.PRICING_PATH ?? join(packageRoot, "pricing.json");
 const defaultSessionId = process.env.DEFAULT_SESSION_ID ?? "default";
+const budgetUsd = envUsd("PROMPTPACE_BUDGET_USD");
 
 const db = openDatabase(dbPath);
 const pricing = loadPricing(pricingPath);
 
-const app = createProxyApp({ upstreamUrl, db, pricing, defaultSessionId });
+const app = createProxyApp({ upstreamUrl, db, pricing, defaultSessionId, budgetUsd });
 
 const server = serve({ fetch: app.fetch, port }, (info) => {
   console.log(`[proxy] listening on http://127.0.0.1:${info.port}`);
   console.log(`[proxy] upstream ${upstreamUrl}`);
   console.log(`[proxy] sqlite ${dbPath}`);
+  console.log(`[proxy] default session budget ${budgetUsd === null ? "none" : `$${budgetUsd}`}`);
 });
 
 function shutdown(): void {
