@@ -1,0 +1,29 @@
+{
+  "name": "promptpace",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Local spend, budget and runaway-loop proxy for AI coding tools",
+  "workspaces": [
+    "proxy",
+    "dashboard",
+    "mock-llm"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n mock,proxy,dashboard -c cyan,magenta,green \"npm:dev:mock\" \"npm:dev:proxy\" \"npm:dev:dashboard\"",
+    "dev:core": "concurrently -k -n mock,proxy -c cyan,magenta \"npm:dev:mock\" \"npm:dev:proxy\"",
+    "dev:mock": "npm run dev --workspace mock-llm",
+    "dev:proxy": "npm run dev --workspace proxy",
+    "dev:dashboard": "npm run dev --workspace dashboard",
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "build": "npm run build --workspaces --if-present"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.0",
+    "typescript": "^5.9.2"
+  },
+  "allowScripts": {
+    "better-sqlite3@12.11.1": true,
+    "esbuild@0.28.2": true
+  }
+}

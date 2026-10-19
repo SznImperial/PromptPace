@@ -1,0 +1,21 @@
+{
+  "currency": "USD",
+  "unit": "per_million_tokens",
+  "_comment": "PLACEHOLDER PRICES ONLY - TODO_VERIFY every value against the provider's official pricing page. Values are intentionally zero so no real price is invented.",
+  "models": {
+    "mock-claude": {
+      "input_per_mtok": 0,
+      "output_per_mtok": 0,
+      "cache_creation_per_mtok": 0,
+      "cache_read_per_mtok": 0,
+      "todo_verify": true
+    },
+    "default": {
+      "input_per_mtok": 0,
+      "output_per_mtok": 0,
+      "cache_creation_per_mtok": 0,
+      "cache_read_per_mtok": 0,
+      "todo_verify": true
+    }
+  }
+}
