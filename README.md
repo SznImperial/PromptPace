@@ -3,18 +3,18 @@
 Local proxy that sits between AI coding tools and LLM provider APIs. It tracks spend,
 enforces budgets and detects runaway request loops. No cloud services, no paid APIs.
 
-**Status:** monorepo scaffold, mock provider, pass-through proxy (streaming and
-non-streaming), SQLite request log, per-session budget cap, loop detection, a
-loopback-only admin API, a three-view dashboard and tests.
+**Status:** Proof of concept: proxy, streaming, budgets, loop detection and dashboard
+implemented and tested.
 
 ## Layout
 
 ```
 proxy/       Hono on Node + better-sqlite3. Pass-through proxy, request log, pricing.
 mock-llm/    Fake Anthropic-shaped provider: normal + streaming responses, usage numbers.
-dashboard/   Next.js + Tailwind scaffold. Reads the proxy HTTP API (phase 2).
+dashboard/   Next.js + Tailwind. Reads the proxy HTTP API from the server side.
 pricing.json Proxy price table. Placeholder values, see Pricing below.
 docs/        WALKTHROUGH.md: how the code works and why, for explaining it.
+docs/screenshots/  Images of the dashboard, generated from the running app.
 ```
 
 ## Run
@@ -112,6 +112,28 @@ The page has three views and polls every two seconds:
    `flagged` and `partial`.
 3. **Alerts** — the flagged and blocked rows, with the repeat count and the action taken.
 
+![View 1: cost over time, with the burn rate and the spend against the cap](docs/screenshots/cost-chart.png)
+
+*View 1 — cost per minute for the last 15 minutes, the burn rate, the spend and the
+sum of the per-session caps.*
+
+![View 2: live request feed with blocked, flagged and partial badges](docs/screenshots/request-feed.png)
+
+*View 2 — the request feed. The 402 row is a budget block, the 422 row is a detected
+loop (blocked and flagged). Rows marked partial only carry the usage seen before the
+stream broke, so their cost is a lower bound.*
+
+![View 3: alerts with the repeat count and the action taken](docs/screenshots/alerts.png)
+
+*View 3 — the alerts: a loop blocked after three repeats in the window, and a request
+blocked by the budget before the loop check ran.*
+
+> **The dollar figures are illustrative.** `proxy/pricing.json` ships with zeros marked
+> `todo_verify`, and `scripts/demo.sh` writes a temporary price file with clearly fake
+> numbers, because real prices are not in the repository. Every amount in the dashboard
+> and in these screenshots is therefore a placeholder: fill in the real prices from the
+> provider's pricing page before reading anything into the numbers.
+
 The browser never calls the proxy. `dashboard/lib/proxy.ts` runs on the Next server and
 calls `http://127.0.0.1:8787`; the page calls the Next route handlers in `dashboard/app/api/`.
 
@@ -121,6 +143,10 @@ detection) is one command:
 ```bash
 bash scripts/demo.sh
 ```
+
+The images in `docs/screenshots/` are real renders of the running dashboard, taken with
+`node scripts/screenshots.mjs` (needs `npm i -D puppeteer-core` and a local Chrome or
+Edge). The whole page is in `docs/screenshots/dashboard.png`.
 
 ```bash
 curl -X POST http://127.0.0.1:8787/admin/sessions/4f2a1c9b7d30/budget \

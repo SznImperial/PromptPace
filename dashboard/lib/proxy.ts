@@ -47,6 +47,8 @@ export interface Alert {
   action: string;
   status: number;
   cost: number;
+  /** The session the alert belongs to. */
+  session: string;
 }
 
 export function proxyBaseUrl(): string {
@@ -90,10 +92,10 @@ export async function getSeries(options: {
 
 export async function getAlerts(session: string | null): Promise<Alert[]> {
   if (session) {
-    const json = await proxyFetch<{ alerts: Alert[] }>(
+    const json = await proxyFetch<{ alerts: Omit<Alert, "session">[] }>(
       `/admin/sessions/${encodeURIComponent(session)}/alerts`,
     );
-    return json.alerts;
+    return json.alerts.map((alert) => ({ ...alert, session }));
   }
 
   // "All sessions": the alerts endpoint works per session, so merge them.

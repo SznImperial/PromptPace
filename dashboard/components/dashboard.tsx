@@ -132,7 +132,20 @@ export function Dashboard({
   }, [series]);
 
   const spent = selected ? selected.spent : totalSpent;
-  const cap = selected ? selected.cap : null;
+
+  // For a single session the cap is its own. For "all sessions" it is the sum
+  // of the per-session caps, as long as every session has one.
+  const caps = sessions.map((entry) => entry.cap);
+  const cap = selected
+    ? selected.cap
+    : caps.length > 0 && caps.every((value) => value !== null)
+      ? caps.reduce<number>((sum, value) => sum + (value ?? 0), 0)
+      : null;
+  const capHint = selected
+    ? "per-session cap"
+    : cap === null
+      ? "some sessions have no cap"
+      : "sum of the per-session caps";
   const capRatio = cap && cap > 0 ? Math.min(spent / cap, 1) : null;
 
   return (
@@ -194,7 +207,7 @@ export function Dashboard({
             <Stat
               label="Cap"
               value={cap === null ? "no cap" : usd(cap)}
-              hint={cap === null ? "PROMPTPACE_BUDGET_USD is not set" : "per-session cap"}
+              hint={capHint}
             />
           </div>
           {capRatio !== null ? (
@@ -313,11 +326,14 @@ export function Dashboard({
                     <Badge kind="flagged">flagged</Badge>
                   )}
                   <span className="text-zinc-400">
-                    {alert.repeat_count} repeats in the window
+                    {alert.fingerprint
+                      ? `${alert.repeat_count} repeats in the window`
+                      : "no fingerprint, blocked before the loop check"}
                   </span>
                   <span className="font-mono text-xs text-zinc-600">
-                    {alert.fingerprint ?? "no fingerprint"}
+                    {alert.fingerprint ?? "-"}
                   </span>
+                  <span className="font-mono text-xs text-zinc-600">{alert.session}</span>
                   <span className="ml-auto font-mono text-xs text-zinc-500">
                     status {alert.status}
                   </span>
