@@ -14,6 +14,7 @@ proxy/       Hono on Node + better-sqlite3. Pass-through proxy, request log, pri
 mock-llm/    Fake Anthropic-shaped provider: normal + streaming responses, usage numbers.
 dashboard/   Next.js + Tailwind scaffold. Reads the proxy HTTP API (phase 2).
 pricing.json Proxy price table. Placeholder values, see Pricing below.
+docs/        WALKTHROUGH.md: how the code works and why, for explaining it.
 ```
 
 ## Run
@@ -28,9 +29,16 @@ Other commands:
 ```bash
 npm run dev:core   # mock-llm + proxy only
 npm test           # vitest across proxy and mock-llm
+npm run verify     # safety checks: no tracked secrets, typecheck, tests
 npm run typecheck  # tsc --noEmit everywhere
 npm run build      # dashboard production build
 ```
+
+`npm run verify` runs `scripts/verify.sh` and exits non-zero when a check fails: no
+tracked `.db`/`.db-wal`/`.db-shm`/`.env`/`*.key` files, no API-key-shaped strings outside
+clearly fake test fixtures, a clean typecheck, all tests green, and no code in the
+admin/loopback path reading `x-forwarded-for`, `x-real-ip` or `forwarded`. The script is
+bash: on Windows run it from Git Bash.
 
 ## Use it
 
@@ -99,6 +107,8 @@ A request is flagged when the same fingerprint was seen at least
 `PROMPTPACE_LOOP_THRESHOLD` times for the same session within
 `PROMPTPACE_LOOP_WINDOW_SECONDS` (the current request counts). Requests whose last
 message has no usable text (empty, image only) get no fingerprint and are never flagged.
+Text shorter than `PROMPTPACE_LOOP_MIN_CHARS` (default 25) is also not fingerprinted, so
+short filler replies such as "continue" never look like a loop.
 
 By default a loop is only **flagged**: the request is forwarded and the row is marked
 `flagged = 1`. With `PROMPTPACE_LOOP_BLOCK=true` the request is not sent upstream and
@@ -123,6 +133,7 @@ Blocked loops are logged with `blocked = 1`, `flagged = 1`, zero tokens.
 | `PROMPTPACE_LOOP_THRESHOLD` | `4` | proxy |
 | `PROMPTPACE_LOOP_WINDOW_SECONDS` | `120` | proxy |
 | `PROMPTPACE_LOOP_BLOCK` | `false` (flag only) | proxy |
+| `PROMPTPACE_LOOP_MIN_CHARS` | `25` | proxy |
 | `MOCK_PORT` | `8788` | mock-llm |
 | `MOCK_DELAY_MS` | `80` | mock-llm |
 | `MOCK_INPUT_TOKENS` / `MOCK_OUTPUT_TOKENS` | `120` / `240` | mock-llm |
@@ -197,5 +208,12 @@ cache_read_tokens/1e6 * cache_read_per_mtok`. Unknown models fall back to the `d
 - Loop detection is a heuristic. Normalisation merges messages that only differ in
   numbers or ids (that is the point), so two genuinely different requests can share a
   fingerprint, and one repeated request that varies in wording will not match itself.
+- In block mode, blocked attempts count toward the window. A blocked attempt is logged
+  with the same fingerprint, so a session that keeps retrying keeps filling the window
+  and stays blocked.
+- The admin API is for local use only. Behind Docker or a reverse proxy the loopback
+  check cannot be trusted: the proxy may see the proxy's own address as the client, and
+  the `Host` header can be rewritten by whoever sits in front. Keep it bound to
+  127.0.0.1 and do not expose it.
 - No dashboard data yet.
 - No auth, no multi-user, no billing, no hosting.

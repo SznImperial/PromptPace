@@ -14,6 +14,13 @@ function envInt(name: string, fallback: number): number {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function envNonNegativeInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const parsed = Number(raw);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
 function envUsd(name: string): number | null {
   const raw = process.env[name];
   if (raw === undefined || raw.trim() === "") return null;
@@ -33,6 +40,7 @@ const loop = {
   threshold: envInt("PROMPTPACE_LOOP_THRESHOLD", 4),
   windowSeconds: envInt("PROMPTPACE_LOOP_WINDOW_SECONDS", 120),
   block: process.env.PROMPTPACE_LOOP_BLOCK === "true",
+  minChars: envNonNegativeInt("PROMPTPACE_LOOP_MIN_CHARS", 25),
 };
 
 const db = openDatabase(dbPath);
@@ -46,7 +54,7 @@ const server = serve({ fetch: app.fetch, port }, (info) => {
   console.log(`[proxy] sqlite ${dbPath}`);
   console.log(`[proxy] default session budget ${budgetUsd === null ? "none" : `$${budgetUsd}`}`);
   console.log(
-    `[proxy] loop detection threshold ${loop.threshold} in ${loop.windowSeconds}s (${loop.block ? "block" : "flag only"})`,
+    `[proxy] loop detection threshold ${loop.threshold} in ${loop.windowSeconds}s (${loop.block ? "block" : "flag only"}), min ${loop.minChars} chars`,
   );
 });
 

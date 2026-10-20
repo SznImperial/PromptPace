@@ -140,10 +140,10 @@ describe("session id derivation", () => {
   it("derives a stable id from the credential, keeps it out of the database and lets the header win", async () => {
     await startProxy();
 
-    const key = "sk-ant-secret-value-123";
+    const key = "sk-fake-secret-value-123";
     await post(REQUEST_BODY, { "x-api-key": key });
     await post(REQUEST_BODY, { "x-api-key": key });
-    await post(REQUEST_BODY, { "x-api-key": "sk-ant-other-key-456" });
+    await post(REQUEST_BODY, { "x-api-key": "sk-fake-other-key-456" });
     await post(REQUEST_BODY, { "x-api-key": key, "x-promptpace-session": "explicit-session" });
 
     const all = rows();
@@ -162,7 +162,7 @@ describe("session id derivation", () => {
       JSON.stringify(db!.prepare("SELECT * FROM session_budgets").all()) +
       JSON.stringify(db!.prepare("SELECT * FROM session_baselines").all());
     expect(dump).not.toContain(key);
-    expect(dump).not.toContain("sk-ant-other-key-456");
+    expect(dump).not.toContain("sk-fake-other-key-456");
 
     for (const file of [dbPath, `${dbPath}-wal`]) {
       if (!existsSync(file)) continue;
@@ -175,12 +175,12 @@ describe("budget cap", () => {
   it("passes a request under the cap and blocks the next one with 402 without touching the upstream", async () => {
     await startProxy({ budgetUsd: 0.002 });
 
-    const first = await post(REQUEST_BODY, { "x-api-key": "sk-test-1", ...USAGE_HEADERS });
+    const first = await post(REQUEST_BODY, { "x-api-key": "sk-fake-test-1", ...USAGE_HEADERS });
     expect(first.status).toBe(200);
     const hitsAfterFirst = mockHits;
     expect(hitsAfterFirst).toBe(1);
 
-    const second = await post(REQUEST_BODY, { "x-api-key": "sk-test-1", ...USAGE_HEADERS });
+    const second = await post(REQUEST_BODY, { "x-api-key": "sk-fake-test-1", ...USAGE_HEADERS });
     expect(second.status).toBe(402);
 
     const json = (await second.json()) as { type: string; error: { type: string; message: string } };
@@ -208,11 +208,11 @@ describe("budget cap", () => {
   it("blocks a streaming request with 402 and opens no upstream connection", async () => {
     await startProxy({ budgetUsd: 0.002 });
 
-    const first = await post(REQUEST_BODY, { "x-api-key": "sk-test-1", ...USAGE_HEADERS });
+    const first = await post(REQUEST_BODY, { "x-api-key": "sk-fake-test-1", ...USAGE_HEADERS });
     expect(first.status).toBe(200);
     const hits = mockHits;
 
-    const res = await post(STREAM_BODY, { "x-api-key": "sk-test-1", ...USAGE_HEADERS });
+    const res = await post(STREAM_BODY, { "x-api-key": "sk-fake-test-1", ...USAGE_HEADERS });
     expect(res.status).toBe(402);
     const json = (await res.json()) as { error: { type: string } };
     expect(json.error.type).toBe("budget_exceeded");
@@ -229,7 +229,7 @@ describe("budget cap", () => {
   it("lets a per-session cap override the env default", async () => {
     await startProxy({ budgetUsd: 0.001 });
 
-    const key = "sk-test-2";
+    const key = "sk-fake-test-2";
     const sessionId = deriveSessionId(key, "default");
 
     // The first request is under the cap, the second one is over it.
@@ -246,14 +246,14 @@ describe("budget cap", () => {
     expect(allowed.status).toBe(200);
 
     // Another session is still held to the env default.
-    expect((await post(REQUEST_BODY, { "x-api-key": "sk-test-3", ...USAGE_HEADERS })).status).toBe(200);
-    expect((await post(REQUEST_BODY, { "x-api-key": "sk-test-3", ...USAGE_HEADERS })).status).toBe(402);
+    expect((await post(REQUEST_BODY, { "x-api-key": "sk-fake-test-3", ...USAGE_HEADERS })).status).toBe(200);
+    expect((await post(REQUEST_BODY, { "x-api-key": "sk-fake-test-3", ...USAGE_HEADERS })).status).toBe(402);
   });
 
   it("resets the spend baseline without deleting history", async () => {
     await startProxy({ budgetUsd: 0.002 });
 
-    const key = "sk-test-4";
+    const key = "sk-fake-test-4";
     const sessionId = deriveSessionId(key, "default");
 
     expect((await post(REQUEST_BODY, { "x-api-key": key, ...USAGE_HEADERS })).status).toBe(200);
@@ -300,7 +300,7 @@ describe("admin api", () => {
   it("accepts requests from loopback and reports the session state", async () => {
     await startProxy();
 
-    await post(REQUEST_BODY, { "x-api-key": "sk-admin-test", ...USAGE_HEADERS });
+    await post(REQUEST_BODY, { "x-api-key": "sk-fake-admin-test", ...USAGE_HEADERS });
 
     const res = await admin("GET", "/admin/sessions");
     expect(res.status).toBe(200);
@@ -308,7 +308,7 @@ describe("admin api", () => {
     const json = (await res.json()) as {
       sessions: Array<{ id: string; cap: number | null; spent: number; blocked: number; last_activity: string }>;
     };
-    const session = json.sessions.find((entry) => entry.id === deriveSessionId("sk-admin-test", "default"));
+    const session = json.sessions.find((entry) => entry.id === deriveSessionId("sk-fake-admin-test", "default"));
     expect(session).toBeDefined();
     expect(session!.cap).toBeNull();
     expect(session!.spent).toBeCloseTo(0.0025, 8);

@@ -9,12 +9,15 @@ export interface LoopConfig {
   windowSeconds: number;
   /** Block looped requests instead of only flagging them. */
   block: boolean;
+  /** Shortest normalised text that is fingerprinted at all. */
+  minChars: number;
 }
 
 export const DEFAULT_LOOP_CONFIG: LoopConfig = {
   threshold: 4,
   windowSeconds: 120,
   block: false,
+  minChars: 25,
 };
 
 export interface LoopDecision {
@@ -73,10 +76,14 @@ function textFromContent(content: unknown): string {
 /**
  * Fingerprints the newest content of a request: the last message's text blocks
  * plus the text inside its tool_result blocks. Only the hash is kept, never
- * the content. Requests without usable text (empty, image only) get no
- * fingerprint.
+ * the content. Requests without usable text (empty, image only) or with text
+ * shorter than `minChars` get no fingerprint, so short filler replies such as
+ * "continue" never look like a loop.
  */
-export function fingerprintRequest(body: unknown): string | null {
+export function fingerprintRequest(
+  body: unknown,
+  minChars: number = DEFAULT_LOOP_CONFIG.minChars,
+): string | null {
   const messages = (body as { messages?: unknown } | null)?.messages;
   if (!Array.isArray(messages) || messages.length === 0) return null;
 
@@ -85,7 +92,7 @@ export function fingerprintRequest(body: unknown): string | null {
 
   const text = textFromContent((last as { content?: unknown }).content);
   const normalised = normaliseFingerprintText(text);
-  if (normalised.length === 0) return null;
+  if (normalised.length < minChars) return null;
 
   return createHash("sha256").update(normalised).digest("hex").slice(0, 16);
 }

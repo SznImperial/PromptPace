@@ -171,8 +171,8 @@ describe("fingerprinting", () => {
   });
 
   it("keeps genuinely different text apart", () => {
-    const a = fingerprintRequest({ messages: [{ role: "user", content: "run the tests" }] });
-    const b = fingerprintRequest({ messages: [{ role: "user", content: "run the linter" }] });
+    const a = fingerprintRequest({ messages: [{ role: "user", content: "please run the unit tests" }] });
+    const b = fingerprintRequest({ messages: [{ role: "user", content: "please run the linter checks" }] });
     expect(a).not.toBe(b);
   });
 
@@ -181,7 +181,9 @@ describe("fingerprinting", () => {
       messages: [
         {
           role: "user",
-          content: [{ type: "tool_result", tool_use_id: "t1", content: "the tool output" }],
+          content: [
+            { type: "tool_result", tool_use_id: "t1", content: "the tool output was 42 lines long" },
+          ],
         },
       ],
     });
@@ -190,7 +192,11 @@ describe("fingerprinting", () => {
         {
           role: "user",
           content: [
-            { type: "tool_result", tool_use_id: "t1", content: [{ type: "text", text: "the tool output" }] },
+            {
+              type: "tool_result",
+              tool_use_id: "t1",
+              content: [{ type: "text", text: "the tool output was 42 lines long" }],
+            },
           ],
         },
       ],
@@ -199,7 +205,7 @@ describe("fingerprinting", () => {
     expect(asString).not.toBeNull();
     expect(asString).toBe(asBlocks);
     expect(asString).toBe(
-      fingerprintRequest({ messages: [{ role: "user", content: "the tool output" }] }),
+      fingerprintRequest({ messages: [{ role: "user", content: "the tool output was 42 lines long" }] }),
     );
   });
 
@@ -212,6 +218,17 @@ describe("fingerprinting", () => {
     ).toBeNull();
     expect(fingerprintRequest({ messages: [] })).toBeNull();
     expect(fingerprintRequest({})).toBeNull();
+  });
+
+  it("has no fingerprint for text shorter than the minimum length", () => {
+    expect(fingerprintRequest({ messages: [{ role: "user", content: "continue" }] })).toBeNull();
+    expect(
+      fingerprintRequest({ messages: [{ role: "user", content: "ok, going on with it" }] }),
+    ).toBeNull();
+    // The minimum is configurable.
+    expect(
+      fingerprintRequest({ messages: [{ role: "user", content: "continue" }] }, 5),
+    ).not.toBeNull();
   });
 
   it("normalises whitespace, case, digits and ids", () => {
@@ -245,7 +262,7 @@ describe("loop detection", () => {
   it("never flags requests with different last messages", async () => {
     await startProxy({ loop: { threshold: 4, windowSeconds: 120, block: false } });
 
-    const lastMessages = ["run the tests", "fix the linter", "open a pull request", "run the build", "update the docs"];
+    const lastMessages = ["please run the unit tests", "please fix the linter errors", "please open a pull request", "please run the production build", "please update the project docs"];
 
     for (const lastMessage of lastMessages) {
       const res = await post(growingBody(lastMessages.indexOf(lastMessage), lastMessage), {
@@ -262,7 +279,7 @@ describe("loop detection", () => {
     await startProxy({ loop: { threshold: 4, windowSeconds: 60, block: false } });
 
     for (let turn = 0; turn < 3; turn += 1) {
-      await (await post(growingBody(turn, "same thing again"), { "x-promptpace-session": "loop-3" }))
+      await (await post(growingBody(turn, "please run the same failing command again"), { "x-promptpace-session": "loop-3" }))
         .text();
     }
 
@@ -270,7 +287,7 @@ describe("loop detection", () => {
     const old = new Date(Date.now() - 10 * 60 * 1000).toISOString();
     db!.prepare("UPDATE requests SET timestamp = ?").run(old);
 
-    await (await post(growingBody(3, "same thing again"), { "x-promptpace-session": "loop-3" })).text();
+    await (await post(growingBody(3, "please run the same failing command again"), { "x-promptpace-session": "loop-3" })).text();
 
     const all = rows();
     expect(all[all.length - 1]!.flagged).toBe(0);
@@ -281,11 +298,11 @@ describe("loop detection", () => {
 
     for (let turn = 0; turn < 3; turn += 1) {
       await (
-        await post(growingBody(turn, "same thing again"), { "x-promptpace-session": "loop-4" })
+        await post(growingBody(turn, "please run the same failing command again"), { "x-promptpace-session": "loop-4" })
       ).text();
     }
     // A different session with the same content must not push this one over.
-    await (await post(growingBody(0, "same thing again"), { "x-promptpace-session": "loop-5" })).text();
+    await (await post(growingBody(0, "please run the same failing command again"), { "x-promptpace-session": "loop-5" })).text();
 
     const all = rows();
     expect(all[3]!.flagged).toBe(0);
@@ -296,7 +313,7 @@ describe("loop detection", () => {
     await startProxy({ loop: { threshold: 4, windowSeconds: 120, block: true } });
 
     for (let turn = 0; turn < 3; turn += 1) {
-      const res = await post(growingBody(turn, "same thing again"), {
+      const res = await post(growingBody(turn, "please run the same failing command again"), {
         "x-promptpace-session": "loop-6",
       });
       expect(res.status).toBe(200);
@@ -304,7 +321,7 @@ describe("loop detection", () => {
     }
     const hitsBefore = mockHits;
 
-    const res = await post(growingBody(3, "same thing again"), {
+    const res = await post(growingBody(3, "please run the same failing command again"), {
       "x-promptpace-session": "loop-6",
     });
     expect(res.status).toBe(422);
@@ -334,13 +351,13 @@ describe("loop detection", () => {
   it("flags but forwards in flag only mode", async () => {
     await startProxy({ loop: { threshold: 2, windowSeconds: 120, block: false } });
 
-    const first = await post(growingBody(0, "same thing again"), {
+    const first = await post(growingBody(0, "please run the same failing command again"), {
       "x-promptpace-session": "loop-7",
     });
     expect(first.status).toBe(200);
     await first.text();
 
-    const second = await post(growingBody(1, "same thing again"), {
+    const second = await post(growingBody(1, "please run the same failing command again"), {
       "x-promptpace-session": "loop-7",
     });
     expect(second.status).toBe(200);
@@ -352,8 +369,63 @@ describe("loop detection", () => {
     expect(all[1]!.blocked).toBe(0);
   });
 
-  it("never flags a request without a fingerprint", async () => {
-    await startProxy({ loop: { threshold: 2, windowSeconds: 120, block: true } });
+  it("never flags a short repeated reply such as 'continue'", async () => {
+    await startProxy({ loop: { threshold: 4, windowSeconds: 120, block: true } });
+
+    for (let turn = 0; turn < 10; turn += 1) {
+      const res = await post(growingBody(turn, "continue"), {
+        "x-promptpace-session": "loop-short",
+      });
+      expect(res.status).toBe(200);
+      await res.text();
+    }
+
+    const all = rows();
+    expect(all).toHaveLength(10);
+    expect(all.every((row) => row.fingerprint === null)).toBe(true);
+    expect(all.every((row) => row.flagged === 0)).toBe(true);
+    expect(all.every((row) => row.blocked === 0)).toBe(true);
+  });
+
+  it("still flags a long repeated tool_result error", async () => {
+    await startProxy({ loop: { threshold: 3, windowSeconds: 120, block: true } });
+
+    const body = (turn: number) => ({
+      model: MODEL,
+      max_tokens: 100,
+      messages: [
+        ...Array.from({ length: turn }, (_, i) => ({ role: "user", content: `history ${i}` })),
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "t1",
+              content: "the tool failed with exit code 1 at line 42 of the build script",
+            },
+          ],
+        },
+      ],
+    });
+
+    for (let turn = 0; turn < 2; turn += 1) {
+      const res = await post(body(turn), { "x-promptpace-session": "loop-tool" });
+      expect(res.status).toBe(200);
+      await res.text();
+    }
+
+    const res = await post(body(2), { "x-promptpace-session": "loop-tool" });
+    expect(res.status).toBe(422);
+    const json = (await res.json()) as { error: { type: string } };
+    expect(json.error.type).toBe("loop_detected");
+
+    const all = rows();
+    expect(all[2]!.flagged).toBe(1);
+    expect(all[2]!.blocked).toBe(1);
+    expect(all[2]!.fingerprint).toMatch(/^[0-9a-f]{16}$/);
+  });
+
+  it("never flags a request without a fingerprint", async () => {    await startProxy({ loop: { threshold: 2, windowSeconds: 120, block: true } });
 
     for (let turn = 0; turn < 4; turn += 1) {
       const res = await post(
@@ -450,8 +522,8 @@ describe("admin hardening", () => {
   it("lists recent alerts for a session", async () => {
     await startProxy({ loop: { threshold: 2, windowSeconds: 120, block: false } });
 
-    await (await post(growingBody(0, "same thing again"), { "x-promptpace-session": "loop-10" })).text();
-    await (await post(growingBody(1, "same thing again"), { "x-promptpace-session": "loop-10" })).text();
+    await (await post(growingBody(0, "please run the same failing command again"), { "x-promptpace-session": "loop-10" })).text();
+    await (await post(growingBody(1, "please run the same failing command again"), { "x-promptpace-session": "loop-10" })).text();
 
     const res = await fetch(`http://127.0.0.1:${port}/admin/sessions/loop-10/alerts`);
     expect(res.status).toBe(200);

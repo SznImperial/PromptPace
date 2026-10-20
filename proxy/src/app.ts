@@ -109,7 +109,7 @@ export function createProxyApp(config: ProxyConfig): Hono {
     }
 
     // Loop detection: only the newest content of the request is fingerprinted.
-    const fingerprint = fingerprintRequest(requestJson);
+    const fingerprint = fingerprintRequest(requestJson, loopConfig.minChars);
     const loop = evaluateLoop(config.db, sessionId, fingerprint, loopConfig);
     if (loop.block) {
       writeRow(ZERO_USAGE, false, 422, { blocked: true, fingerprint, flagged: true });
