@@ -124,7 +124,8 @@ function post(body: string, headers: Record<string, string> = {}): Promise<Respo
 function admin(method: string, path: string, body?: unknown): Promise<Response> {
   return fetch(`http://127.0.0.1:${port}${path}`, {
     method,
-    headers: body === undefined ? {} : { "content-type": "application/json" },
+    // Admin writes require a JSON content type.
+    headers: method === "POST" ? { "content-type": "application/json" } : {},
     body: body === undefined ? undefined : JSON.stringify(body),
   });
 }

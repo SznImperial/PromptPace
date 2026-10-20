@@ -4,8 +4,8 @@ Local proxy that sits between AI coding tools and LLM provider APIs. It tracks s
 enforces budgets and detects runaway request loops. No cloud services, no paid APIs.
 
 **Status:** monorepo scaffold, mock provider, pass-through proxy (streaming and
-non-streaming), SQLite request log, per-session budget cap with a loopback-only admin
-API, tests. Loop detection and live dashboard data are not built yet.
+non-streaming), SQLite request log, per-session budget cap, loop detection, a
+loopback-only admin API, tests. Live dashboard data is not built yet.
 
 ## Layout
 
@@ -70,11 +70,15 @@ The check runs for streaming and non-streaming requests alike.
 
 ### Admin API
 
-Loopback callers only (127.0.0.0/8 and ::1); anything else gets HTTP 403.
+Loopback callers only. Three checks apply to every admin request: the caller must be on
+the loopback interface (read from the TCP socket, no forwarded header can influence it),
+the `Host` header must name the local proxy on that port, and admin writes must send
+`Content-Type: application/json`. Violations get HTTP 403 or 415. No CORS headers are sent.
 
 | Endpoint | Effect |
 | --- | --- |
 | `GET /admin/sessions` | id, cap, spent, blocked count, last activity per session |
+| `GET /admin/sessions/:id/alerts` | recent flagged and blocked rows: timestamp, fingerprint, repeat count, action |
 | `POST /admin/sessions/:id/budget` `{"cap_usd": 2.5}` | set the cap for one session (overrides the env default) |
 | `POST /admin/sessions/:id/reset` | reset the spend baseline, history is kept |
 
@@ -82,6 +86,29 @@ Loopback callers only (127.0.0.0/8 and ::1); anything else gets HTTP 403.
 curl -X POST http://127.0.0.1:8787/admin/sessions/4f2a1c9b7d30/budget \
   -H 'content-type: application/json' -d '{"cap_usd": 2.5}'
 ```
+
+## Loop detection
+
+Every request is fingerprinted from its **newest content only**: the last message's text
+blocks plus the text inside its `tool_result` blocks (a tool result holds a string or a
+list of blocks). The text is normalised before hashing — lowercased, whitespace collapsed,
+digit runs replaced with `#`, ids and hex/uuid tokens replaced with `<id>` — and hashed
+with SHA-256. Only the 16 hex character hash is stored, never the content.
+
+A request is flagged when the same fingerprint was seen at least
+`PROMPTPACE_LOOP_THRESHOLD` times for the same session within
+`PROMPTPACE_LOOP_WINDOW_SECONDS` (the current request counts). Requests whose last
+message has no usable text (empty, image only) get no fingerprint and are never flagged.
+
+By default a loop is only **flagged**: the request is forwarded and the row is marked
+`flagged = 1`. With `PROMPTPACE_LOOP_BLOCK=true` the request is not sent upstream and
+the client gets HTTP 422:
+
+```json
+{"type":"error","error":{"type":"loop_detected","message":"Loop detected: this request matches 4 requests with the same content for the same session within the last 120 seconds (threshold 4). The request was not sent upstream. If this is expected, raise PROMPTPACE_LOOP_THRESHOLD or set PROMPTPACE_LOOP_BLOCK=false."}}
+```
+
+Blocked loops are logged with `blocked = 1`, `flagged = 1`, zero tokens.
 
 ## Environment
 
@@ -93,6 +120,9 @@ curl -X POST http://127.0.0.1:8787/admin/sessions/4f2a1c9b7d30/budget \
 | `PRICING_PATH` | `proxy/pricing.json` | proxy |
 | `DEFAULT_SESSION_ID` | `default` | proxy |
 | `PROMPTPACE_BUDGET_USD` | unset (no cap) | proxy |
+| `PROMPTPACE_LOOP_THRESHOLD` | `4` | proxy |
+| `PROMPTPACE_LOOP_WINDOW_SECONDS` | `120` | proxy |
+| `PROMPTPACE_LOOP_BLOCK` | `false` (flag only) | proxy |
 | `MOCK_PORT` | `8788` | mock-llm |
 | `MOCK_DELAY_MS` | `80` | mock-llm |
 | `MOCK_INPUT_TOKENS` / `MOCK_OUTPUT_TOKENS` | `120` / `240` | mock-llm |
@@ -123,7 +153,9 @@ Every request is written to the `requests` table:
 | `status` | upstream HTTP status |
 | `session_id` | `x-promptpace-session` header, else the credential hash, else the default |
 | `partial` | `1` when the stream did not finish cleanly (no `message_stop`, client gone, upstream died) |
-| `blocked` | `1` when the request was rejected by the budget cap |
+| `blocked` | `1` when the request was rejected by the budget cap or by loop detection |
+| `fingerprint` | 16 hex characters of the SHA-256 of the normalised newest content, or null |
+| `flagged` | `1` when the fingerprint repeated inside the loop window |
 
 ```bash
 node -e "const D=require('better-sqlite3');console.log(new D('proxy/data/promptpace.db',{readonly:true}).prepare('select * from requests').all())"
@@ -162,5 +194,8 @@ cache_read_tokens/1e6 * cache_read_per_mtok`. Unknown models fall back to the `d
   cost of a partial row is a lower bound on what the request actually cost.
 - A stream that ends without `message_stop` is logged as partial even if the upstream
   closed cleanly.
-- No loop detection, no dashboard data yet.
+- Loop detection is a heuristic. Normalisation merges messages that only differ in
+  numbers or ids (that is the point), so two genuinely different requests can share a
+  fingerprint, and one repeated request that varies in wording will not match itself.
+- No dashboard data yet.
 - No auth, no multi-user, no billing, no hosting.

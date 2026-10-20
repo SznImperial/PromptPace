@@ -29,16 +29,25 @@ const pricingPath = process.env.PRICING_PATH ?? join(packageRoot, "pricing.json"
 const defaultSessionId = process.env.DEFAULT_SESSION_ID ?? "default";
 const budgetUsd = envUsd("PROMPTPACE_BUDGET_USD");
 
+const loop = {
+  threshold: envInt("PROMPTPACE_LOOP_THRESHOLD", 4),
+  windowSeconds: envInt("PROMPTPACE_LOOP_WINDOW_SECONDS", 120),
+  block: process.env.PROMPTPACE_LOOP_BLOCK === "true",
+};
+
 const db = openDatabase(dbPath);
 const pricing = loadPricing(pricingPath);
 
-const app = createProxyApp({ upstreamUrl, db, pricing, defaultSessionId, budgetUsd });
+const app = createProxyApp({ upstreamUrl, db, pricing, defaultSessionId, budgetUsd, loop });
 
 const server = serve({ fetch: app.fetch, port }, (info) => {
   console.log(`[proxy] listening on http://127.0.0.1:${info.port}`);
   console.log(`[proxy] upstream ${upstreamUrl}`);
   console.log(`[proxy] sqlite ${dbPath}`);
   console.log(`[proxy] default session budget ${budgetUsd === null ? "none" : `$${budgetUsd}`}`);
+  console.log(
+    `[proxy] loop detection threshold ${loop.threshold} in ${loop.windowSeconds}s (${loop.block ? "block" : "flag only"})`,
+  );
 });
 
 function shutdown(): void {

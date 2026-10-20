@@ -17,6 +17,17 @@ export interface RequestRecord {
   sessionId: string;
   partial: boolean;
   blocked: boolean;
+  fingerprint: string | null;
+  flagged: boolean;
+}
+
+export interface AlertRow {
+  timestamp: string;
+  fingerprint: string | null;
+  status: number;
+  blocked: number;
+  flagged: number;
+  cost: number;
 }
 
 const TABLE = "requests";
@@ -28,6 +39,8 @@ const COLUMNS: Array<[string, string]> = [
   ["cache_read_tokens", "INTEGER NOT NULL DEFAULT 0"],
   ["partial", "INTEGER NOT NULL DEFAULT 0"],
   ["blocked", "INTEGER NOT NULL DEFAULT 0"],
+  ["fingerprint", "TEXT"],
+  ["flagged", "INTEGER NOT NULL DEFAULT 0"],
 ];
 
 export function openDatabase(filePath: string): Db {
@@ -50,10 +63,13 @@ export function openDatabase(filePath: string): Db {
       cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
       cache_read_tokens INTEGER NOT NULL DEFAULT 0,
       partial INTEGER NOT NULL DEFAULT 0,
-      blocked INTEGER NOT NULL DEFAULT 0
+      blocked INTEGER NOT NULL DEFAULT 0,
+      fingerprint TEXT,
+      flagged INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS idx_requests_timestamp ON ${TABLE} (timestamp);
     CREATE INDEX IF NOT EXISTS idx_requests_session ON ${TABLE} (session_id);
+    CREATE INDEX IF NOT EXISTS idx_requests_fingerprint ON ${TABLE} (session_id, fingerprint);
 
     CREATE TABLE IF NOT EXISTS ${SESSION_BUDGETS} (
       session_id TEXT PRIMARY KEY,
@@ -81,8 +97,8 @@ export function openDatabase(filePath: string): Db {
 export function recordRequest(db: Db, record: RequestRecord): void {
   db.prepare(
     `INSERT INTO ${TABLE}
-      (id, timestamp, model, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, cost, status, session_id, partial, blocked)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      (id, timestamp, model, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, cost, status, session_id, partial, blocked, fingerprint, flagged)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     record.id,
     record.timestamp,
@@ -96,7 +112,56 @@ export function recordRequest(db: Db, record: RequestRecord): void {
     record.sessionId,
     record.partial ? 1 : 0,
     record.blocked ? 1 : 0,
+    record.fingerprint,
+    record.flagged ? 1 : 0,
   );
+}
+
+/** How many requests with the same fingerprint the session made in the window. */
+export function countRepeats(
+  db: Db,
+  sessionId: string,
+  fingerprint: string,
+  windowSeconds: number,
+  now: Date = new Date(),
+): number {
+  const since = new Date(now.getTime() - windowSeconds * 1000).toISOString();
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS count FROM ${TABLE} WHERE session_id = ? AND fingerprint = ? AND timestamp > ?`,
+    )
+    .get(sessionId, fingerprint, since) as { count: number };
+  return row.count;
+}
+
+/** How many requests with the same fingerprint the session had at a point in time. */
+export function countRepeatsAt(
+  db: Db,
+  sessionId: string,
+  fingerprint: string,
+  windowSeconds: number,
+  at: Date,
+): number {
+  const since = new Date(at.getTime() - windowSeconds * 1000).toISOString();
+  const atIso = at.toISOString();
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS count FROM ${TABLE}
+       WHERE session_id = ? AND fingerprint = ? AND timestamp <= ? AND timestamp > ?`,
+    )
+    .get(sessionId, fingerprint, atIso, since) as { count: number };
+  return row.count;
+}
+
+/** Recent flagged or blocked rows for a session, newest first. */
+export function getSessionAlerts(db: Db, sessionId: string, limit = 50): AlertRow[] {
+  return db
+    .prepare(
+      `SELECT timestamp, fingerprint, status, blocked, flagged, cost FROM ${TABLE}
+       WHERE session_id = ? AND (flagged = 1 OR blocked = 1)
+       ORDER BY timestamp DESC LIMIT ?`,
+    )
+    .all(sessionId, limit) as AlertRow[];
 }
 
 /** The per-session cap in USD, or null when the session has no override. */
