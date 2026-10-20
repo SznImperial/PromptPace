@@ -4,9 +4,11 @@ import { checkSessionBudget } from "./budget.js";
 import type { Db } from "./db.js";
 import {
   countRepeatsAt,
+  getCostSeries,
   getSessionAlerts,
   getSessionBlockedCount,
   getSessionLastActivity,
+  listRequests,
   listSessionIds,
   resetSessionBaseline,
   setSessionCap,
@@ -84,6 +86,12 @@ function isJsonContentType(value: string | undefined): boolean {
   return value.trim().toLowerCase().split(";")[0]!.trim() === "application/json";
 }
 
+function clampInt(value: string | undefined, fallback: number, min: number, max: number): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed)) return fallback;
+  return Math.min(Math.max(parsed, min), max);
+}
+
 export function createAdminApp(config: AdminConfig): Hono {
   const app = new Hono();
 
@@ -96,7 +104,16 @@ export function createAdminApp(config: AdminConfig): Hono {
       );
     }
 
-    // 2. The Host header must point at this proxy on the loopback interface.
+    // 2. Cross-site browser requests are not allowed. Server-side fetches do
+    //    not send this header and keep working.
+    if (c.req.header("sec-fetch-site")?.trim().toLowerCase() === "cross-site") {
+      return c.json(
+        errorBody("forbidden", "Cross-site admin requests are not allowed."),
+        403,
+      );
+    }
+
+    // 3. The Host header must point at this proxy on the loopback interface.
     if (!isAllowedAdminHost(c.req.header("host"), config.localPort(c))) {
       return c.json(
         errorBody("forbidden", "The admin API only accepts requests addressed to the local proxy."),
@@ -104,7 +121,7 @@ export function createAdminApp(config: AdminConfig): Hono {
       );
     }
 
-    // 3. Admin writes must be JSON.
+    // 4. Admin writes must be JSON.
     if (c.req.method === "POST" && !isJsonContentType(c.req.header("content-type"))) {
       return c.json(
         errorBody("invalid_request_error", "Content-Type must be application/json."),
@@ -113,6 +130,18 @@ export function createAdminApp(config: AdminConfig): Hono {
     }
 
     await next();
+  });
+
+  app.get("/requests", (c) => {
+    const limit = clampInt(c.req.query("limit"), 50, 1, 500);
+    const sessionId = c.req.query("session")?.trim() || null;
+    return c.json({ requests: listRequests(config.db, { limit, sessionId }) });
+  });
+
+  app.get("/series", (c) => {
+    const minutes = clampInt(c.req.query("minutes"), 60, 1, 1440);
+    const sessionId = c.req.query("session")?.trim() || null;
+    return c.json({ minutes, series: getCostSeries(config.db, { minutes, sessionId }) });
   });
 
   app.get("/sessions", (c) => {

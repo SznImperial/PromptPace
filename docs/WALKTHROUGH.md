@@ -252,7 +252,32 @@ reading the tool output knows what happened.
 
 ---
 
-## 6. Design decisions and their tradeoffs
+## 6. The dashboard
+
+The dashboard is a Next.js app in `dashboard/`. It has three views and nothing else.
+
+| View | What it shows | Where the data comes from |
+| --- | --- | --- |
+| Cost over time | an inline SVG chart of cost per minute, the burn rate in $/min, spent against the cap | `GET /admin/series` and `GET /admin/sessions` |
+| Live request feed | the newest requests first, with badges for blocked, flagged and partial | `GET /admin/requests` |
+| Alerts | the flagged and blocked rows with their repeat count | `GET /admin/sessions/:id/alerts` |
+
+**The browser never talks to the proxy.** The proxy sends no CORS headers and rejects
+cross-site requests, so the page polls the Next route handlers in `dashboard/app/api/`
+every two seconds. Those handlers call `dashboard/lib/proxy.ts`, which runs on the Next
+server and calls `http://127.0.0.1:8787`. The first render happens on the server
+(`dashboard/app/page.tsx`), so the page is not empty while the first poll runs.
+
+The cost chart is a small inline SVG (`dashboard/components/cost-chart.tsx`). There is no
+chart library: the data is a list of buckets, and a path plus a few grid lines is
+enough.
+
+Rows marked `partial` are labelled in the UI as a lower bound, because a partial row
+only carries the usage that was seen before the stream broke.
+
+---
+
+## 7. Design decisions and their tradeoffs
 
 | Decision | Why | What it costs |
 | --- | --- | --- |
@@ -270,7 +295,7 @@ reading the tool output knows what happened.
 
 ---
 
-## 7. Known limitations
+## 8. Known limitations
 
 - **The budget cap is soft.** The cap is checked before the request is forwarded, but
   in-flight requests are not reserved against it. Several requests that each start under
@@ -283,7 +308,10 @@ reading the tool output knows what happened.
   time, and it can flag two different requests that normalise to the same text.
 - **The admin API is for local use only.** Behind Docker or a reverse proxy the loopback
   check cannot be trusted: the proxy may see its own address as the client, and the
-  `Host` header can be rewritten. Keep it bound to 127.0.0.1.
+  `Host` header can be rewritten. The proxy binds to 127.0.0.1 by default, and
+  `npm run verify` fails if that default ever becomes 0.0.0.0.
+- **The dashboard is read-only.** It shows what the proxy recorded; it cannot change a
+  cap or reset a session. That is the admin API, and it is not exposed to the browser.
 - **Prices are placeholders.** `proxy/pricing.json` is all zeros until somebody fills
   in the real numbers, so the cost column is only as good as that file.
 - **No dashboard yet.** The dashboard is a Next.js scaffold; the data is in SQLite and
@@ -293,7 +321,7 @@ reading the tool output knows what happened.
 
 ---
 
-## 8. The three files where a mistake would be most costly
+## 9. The three files where a mistake would be most costly
 
 1. **`proxy/src/admin.ts` — security.** It decides who may change caps, reset spend and
    read session data. A mistake here (trusting a header, accepting a foreign `Host`,
@@ -309,7 +337,7 @@ reading the tool output knows what happened.
 
 ---
 
-## 9. Ten likely interview questions
+## 10. Ten likely interview questions
 
 **1. What does the proxy actually do?**
 It forwards Anthropic-shaped requests to an upstream unchanged, and records what each

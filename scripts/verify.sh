@@ -91,6 +91,26 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+section "6. The proxy binds to the loopback interface by default"
+BIND_DEFAULT="$(git grep -n 'DEFAULT_BIND_HOST = ' -- proxy/src/config.ts || true)"
+if [ -z "$BIND_DEFAULT" ]; then
+  fail "could not find the default bind address in proxy/src/config.ts"
+elif printf '%s' "$BIND_DEFAULT" | grep -q '"127\.0\.0\.1"'; then
+  pass "the default bind address is 127.0.0.1"
+else
+  fail "the default bind address must be 127.0.0.1:"
+  printf '%s\n' "$BIND_DEFAULT" | sed 's/^/          /'
+fi
+
+WILDCARD_BIND="$(git grep -n '"0\.0\.0\.0"' -- proxy/src || true)"
+if [ -z "$WILDCARD_BIND" ]; then
+  pass "proxy/src never binds to 0.0.0.0"
+else
+  fail "proxy/src must not bind to 0.0.0.0:"
+  printf '%s\n' "$WILDCARD_BIND" | sed 's/^/          /'
+fi
+
+# ---------------------------------------------------------------------------
 printf '\n'
 if [ "$FAILURES" -eq 0 ]; then
   printf 'All checks passed.\n'

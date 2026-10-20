@@ -5,7 +5,7 @@ enforces budgets and detects runaway request loops. No cloud services, no paid A
 
 **Status:** monorepo scaffold, mock provider, pass-through proxy (streaming and
 non-streaming), SQLite request log, per-session budget cap, loop detection, a
-loopback-only admin API, tests. Live dashboard data is not built yet.
+loopback-only admin API, a three-view dashboard and tests.
 
 ## Layout
 
@@ -78,17 +78,49 @@ The check runs for streaming and non-streaming requests alike.
 
 ### Admin API
 
-Loopback callers only. Three checks apply to every admin request: the caller must be on
+Loopback callers only. Four checks apply to every admin request: the caller must be on
 the loopback interface (read from the TCP socket, no forwarded header can influence it),
+the request must not be a cross-site browser request (`Sec-Fetch-Site: cross-site`),
 the `Host` header must name the local proxy on that port, and admin writes must send
 `Content-Type: application/json`. Violations get HTTP 403 or 415. No CORS headers are sent.
 
 | Endpoint | Effect |
 | --- | --- |
 | `GET /admin/sessions` | id, cap, spent, blocked count, last activity per session |
+| `GET /admin/requests?limit=N&session=ID` | recent request rows, newest first |
+| `GET /admin/series?session=ID&minutes=M` | cost and token totals bucketed per minute |
 | `GET /admin/sessions/:id/alerts` | recent flagged and blocked rows: timestamp, fingerprint, repeat count, action |
 | `POST /admin/sessions/:id/budget` `{"cap_usd": 2.5}` | set the cap for one session (overrides the env default) |
 | `POST /admin/sessions/:id/reset` | reset the spend baseline, history is kept |
+
+`GET /admin/requests` never returns message content: none is stored. The dashboard has
+to fetch through the Next server, because the browser cannot call the proxy (no CORS, and
+cross-site requests are rejected).
+
+## Dashboard
+
+```bash
+npm run dev          # the dashboard is on http://127.0.0.1:3000
+```
+
+The page has three views and polls every two seconds:
+
+1. **Cost over time** — an inline SVG chart of the cost per minute for the selected
+   session, the current burn rate in $/min (the cost of the last five minutes divided by
+   five) and the spend against the cap.
+2. **Live request feed** — the newest requests first, with badges for `blocked`,
+   `flagged` and `partial`.
+3. **Alerts** — the flagged and blocked rows, with the repeat count and the action taken.
+
+The browser never calls the proxy. `dashboard/lib/proxy.ts` runs on the Next server and
+calls `http://127.0.0.1:8787`; the page calls the Next route handlers in `dashboard/app/api/`.
+
+A full demo (mock + proxy + dashboard, normal traffic, a budget block and a loop
+detection) is one command:
+
+```bash
+bash scripts/demo.sh
+```
 
 ```bash
 curl -X POST http://127.0.0.1:8787/admin/sessions/4f2a1c9b7d30/budget \
@@ -134,6 +166,8 @@ Blocked loops are logged with `blocked = 1`, `flagged = 1`, zero tokens.
 | `PROMPTPACE_LOOP_WINDOW_SECONDS` | `120` | proxy |
 | `PROMPTPACE_LOOP_BLOCK` | `false` (flag only) | proxy |
 | `PROMPTPACE_LOOP_MIN_CHARS` | `25` | proxy |
+| `PROMPTPACE_BIND_HOST` | `127.0.0.1` | proxy |
+| `PROMPTPACE_PROXY_URL` | `http://127.0.0.1:8787` | dashboard (server side) |
 | `MOCK_PORT` | `8788` | mock-llm |
 | `MOCK_DELAY_MS` | `80` | mock-llm |
 | `MOCK_INPUT_TOKENS` / `MOCK_OUTPUT_TOKENS` | `120` / `240` | mock-llm |
@@ -208,12 +242,17 @@ cache_read_tokens/1e6 * cache_read_per_mtok`. Unknown models fall back to the `d
 - Loop detection is a heuristic. Normalisation merges messages that only differ in
   numbers or ids (that is the point), so two genuinely different requests can share a
   fingerprint, and one repeated request that varies in wording will not match itself.
+- Requests whose normalised newest text is shorter than `PROMPTPACE_LOOP_MIN_CHARS`
+  (default 25) are never fingerprinted, so very short repeated tool errors are not
+  detected.
 - In block mode, blocked attempts count toward the window. A blocked attempt is logged
   with the same fingerprint, so a session that keeps retrying keeps filling the window
   and stays blocked.
 - The admin API is for local use only. Behind Docker or a reverse proxy the loopback
   check cannot be trusted: the proxy may see the proxy's own address as the client, and
   the `Host` header can be rewritten by whoever sits in front. Keep it bound to
-  127.0.0.1 and do not expose it.
+  127.0.0.1 and do not expose it. The proxy itself binds to 127.0.0.1 by default
+  (`PROMPTPACE_BIND_HOST` changes that, and `npm run verify` fails if the default ever
+  becomes 0.0.0.0).
 - No dashboard data yet.
 - No auth, no multi-user, no billing, no hosting.

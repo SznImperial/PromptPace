@@ -164,6 +164,97 @@ export function getSessionAlerts(db: Db, sessionId: string, limit = 50): AlertRo
     .all(sessionId, limit) as AlertRow[];
 }
 
+export interface RequestListRow {
+  id: string;
+  timestamp: string;
+  model: string;
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
+  cost: number;
+  status: number;
+  partial: number;
+  flagged: number;
+  blocked: number;
+  session_id: string;
+}
+
+/**
+ * The most recent request rows, newest first. Only the columns listed here
+ * are returned; no message content is stored and none is served.
+ */
+export function listRequests(
+  db: Db,
+  options: { limit: number; sessionId: string | null },
+): RequestListRow[] {
+  return db
+    .prepare(
+      `SELECT id, timestamp, model, input_tokens, output_tokens, cache_creation_tokens,
+              cache_read_tokens, cost, status, partial, flagged, blocked, session_id
+       FROM ${TABLE}
+       WHERE (? IS NULL OR session_id = ?)
+       ORDER BY timestamp DESC, rowid DESC
+       LIMIT ?`,
+    )
+    .all(options.sessionId, options.sessionId, options.limit) as RequestListRow[];
+}
+
+export interface SeriesBucket {
+  /** The start of the minute, ISO-8601 UTC. */
+  minute: string;
+  cost: number;
+  input_tokens: number;
+  output_tokens: number;
+  requests: number;
+}
+
+/**
+ * Cost and token totals bucketed per minute over the last `minutes` minutes.
+ * Empty minutes are included so the series is continuous.
+ */
+export function getCostSeries(
+  db: Db,
+  options: { minutes: number; sessionId: string | null },
+): SeriesBucket[] {
+  const now = Date.now();
+  const since = new Date(now - options.minutes * 60_000).toISOString();
+
+  const rows = db
+    .prepare(
+      `SELECT timestamp, cost, input_tokens, output_tokens FROM ${TABLE}
+       WHERE timestamp >= ? AND (? IS NULL OR session_id = ?)`,
+    )
+    .all(since, options.sessionId, options.sessionId) as Array<{
+    timestamp: string;
+    cost: number;
+    input_tokens: number;
+    output_tokens: number;
+  }>;
+
+  const minuteKey = (iso: string): string => `${iso.slice(0, 16)}:00.000Z`;
+  const buckets = new Map<string, SeriesBucket>();
+
+  for (let i = options.minutes; i >= 0; i -= 1) {
+    const key = minuteKey(new Date(now - i * 60_000).toISOString());
+    buckets.set(key, { minute: key, cost: 0, input_tokens: 0, output_tokens: 0, requests: 0 });
+  }
+
+  for (const row of rows) {
+    const key = minuteKey(row.timestamp);
+    const bucket = buckets.get(key);
+    if (!bucket) continue;
+    bucket.cost += row.cost;
+    bucket.input_tokens += row.input_tokens;
+    bucket.output_tokens += row.output_tokens;
+    bucket.requests += 1;
+  }
+
+  return [...buckets.values()]
+    .map((bucket) => ({ ...bucket, cost: Number(bucket.cost.toFixed(8)) }))
+    .sort((a, b) => a.minute.localeCompare(b.minute));
+}
+
 /** The per-session cap in USD, or null when the session has no override. */
 export function getSessionCap(db: Db, sessionId: string): number | null {
   const row = db
