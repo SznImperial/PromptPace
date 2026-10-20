@@ -1,3 +1,5 @@
+[![CI](https://github.com/SznImperial/PromptPace/actions/workflows/ci.yml/badge.svg)](https://github.com/SznImperial/PromptPace/actions/workflows/ci.yml)
+
 # PromptPace
 
 Local proxy that sits between AI coding tools and LLM provider APIs. It tracks spend,
